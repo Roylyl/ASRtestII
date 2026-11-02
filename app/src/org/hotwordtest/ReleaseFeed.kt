@@ -48,6 +48,12 @@ internal data class UpdateRelease(val tag: String, val notes: String, val url: S
     }
 }
 
+private fun releaseApkNames(tag: String) = listOf("ASRtestII-${tag.substring(1)}.apk", "ASRtestII.apk")
+
+internal fun <T> selectReleaseApk(tag: String, choices: List<T>, name: (T) -> String): T? =
+    releaseApkNames(tag).firstNotNullOfOrNull { expected -> choices.firstOrNull { name(it).equals(expected, true) } }
+        ?: choices.singleOrNull()
+
 // GitHub's public latest-release URL identifies the tag by redirect. HEAD never downloads an APK.
 internal object PublicReleaseFallback {
     data class Head(val code: Int, val location: String?, val size: Long, val type: String?)
@@ -80,21 +86,24 @@ internal object PublicReleaseFallback {
         if (tag == null || ReleaseVersion.tag(tag) == null)
             return null to "$status，官方发行页未指向本仓库的Vx.y.z稳定版本"
 
-        val url = URI("https://github.com/$REPO/releases/download/$tag/ASRtestII.apk")
-        var asset = probe(url)
-        if (asset.code in redirects) {
-            val cdn = redirect(url, asset.location)
-            if (cdn == null || cdn.host.lowercase() !in cdnHosts || !assetPath.matches(cdn.rawPath) ||
-                cdn.rawQuery.orEmpty().split('&').none { it.substringBefore('=').lowercase() in
-                    setOf("sig", "signature", "x-amz-signature") && it.substringAfter('=', "").isNotBlank() })
-                throw IOException("$status，附件重定向未指向可信的GitHub发行资产地址")
-            asset = probe(cdn)
+        for (name in releaseApkNames(tag)) {
+            val url = URI("https://github.com/$REPO/releases/download/$tag/$name")
+            var asset = probe(url)
+            if (asset.code in redirects) {
+                val cdn = redirect(url, asset.location)
+                if (cdn == null || cdn.host.lowercase() !in cdnHosts || !assetPath.matches(cdn.rawPath) ||
+                    cdn.rawQuery.orEmpty().split('&').none { it.substringBefore('=').lowercase() in
+                        setOf("sig", "signature", "x-amz-signature") && it.substringAfter('=', "").isNotBlank() })
+                    throw IOException("$status，附件重定向未指向可信的GitHub发行资产地址")
+                asset = probe(cdn)
+            }
+            if (asset.code == 404) continue
+            if (asset.code != 200) throw IOException("$status，官方附件服务返回HTTP${asset.code}")
+            if (asset.size <= 0 || asset.type?.substringBefore(';')?.trim()?.lowercase() !in apkTypes)
+                throw IOException("$status，官方附件未提供可确认的APK类型和字节数")
+            return UpdateRelease(tag, "", url.toString(), asset.size) to ""
         }
-        if (asset.code == 404) return null to "$status，${tag}没有公开的ASRtestII.apk附件（HTTP404）"
-        if (asset.code != 200) throw IOException("$status，官方附件服务返回HTTP${asset.code}")
-        if (asset.size <= 0 || asset.type?.substringBefore(';')?.trim()?.lowercase() !in apkTypes)
-            throw IOException("$status，官方附件未提供可确认的APK类型和字节数")
-        return UpdateRelease(tag, "", url.toString(), asset.size) to ""
+        return null to "$status，${tag}没有公开的ASRtestII发行APK附件（HTTP404）"
     }
 
     private fun request(uri: URI): Head {
@@ -200,8 +209,7 @@ internal object ReleaseFeed {
             it.optString("state") == "uploaded" && it.optLong("size", 0) > 0 &&
                 officialAsset(tag, it.optString("name"), it.optString("browser_download_url"))
         }
-        val asset = choices.firstOrNull { it.getString("name").equals("ASRtestII.apk", true) }
-            ?: choices.singleOrNull()
+        val asset = selectReleaseApk(tag, choices) { it.getString("name") }
             ?: return null to "${tag}没有可识别的官方APK附件"
         val body = latest.optString("body").takeUnless { latest.isNull("body") }.orEmpty()
         return UpdateRelease(tag, body, asset.getString("browser_download_url"), asset.getLong("size")) to ""

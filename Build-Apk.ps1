@@ -14,8 +14,14 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $appDirectory = Join-Path $PSScriptRoot 'app'
+$manifest = Join-Path $appDirectory 'AndroidManifest.xml'
+if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) { throw "源文件尚未就绪：$manifest" }
 if (-not $OutputApk) {
-    $name = if ($Unsigned) { 'ASRtestII-unsigned.apk' } else { 'ASRtestII.apk' }
+    $manifestXml = [xml][IO.File]::ReadAllText($manifest)
+    $version = $manifestXml.DocumentElement.GetAttribute('versionName', 'http://schemas.android.com/apk/res/android')
+    if ($version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') { throw "默认安装包命名要求versionName为三段数字，当前为：$version" }
+    $suffix = if ($Unsigned) { '-unsigned' } else { '' }
+    $name = "ASRtestII-$version$suffix.apk"
     $desktop = [Environment]::GetFolderPath('DesktopDirectory')
     if (-not $desktop) { throw '无法定位Windows桌面，请通过-OutputApk指定输出路径。' }
     $OutputApk = Join-Path $desktop $name
@@ -34,11 +40,7 @@ foreach ($relativePath in $modelFiles) {
         throw "模型文件缺失、为空或仍是Git LFS指针：$relativePath。请在仓库根目录执行git lfs pull后重试。"
     }
 }
-$manifest = Join-Path $appDirectory 'AndroidManifest.xml'
 $sourceDirectory = Join-Path $appDirectory 'src'
-if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
-    throw "源文件尚未就绪：$manifest"
-}
 $sourceFiles = @(Get-ChildItem -LiteralPath $sourceDirectory -Filter '*.java' -File -Recurse)
 $kotlinFiles = @(Get-ChildItem -LiteralPath $sourceDirectory -Filter '*.kt' -File -Recurse)
 if (($sourceFiles.Count + $kotlinFiles.Count) -eq 0) { throw '没有找到Java或Kotlin源码。' }

@@ -7,7 +7,8 @@ fun main() {
     val version = "V1.10.0"
     val latest = "https://github.com/$REPO/releases/latest"
     val tagPage = "/$REPO/releases/tag/$version"
-    val apk = "https://github.com/$REPO/releases/download/$version/ASRtestII.apk"
+    val apk = "https://github.com/$REPO/releases/download/$version/ASRtestII-1.10.0.apk"
+    val legacyApk = "https://github.com/$REPO/releases/download/$version/ASRtestII.apk"
     val cdn = "https://release-assets.githubusercontent.com/github-production-release-asset/1234/ab-cd?sig=signed"
     fun response(code: Int, location: String? = null, bytes: Long = -1, type: String? = null) =
         PublicReleaseFallback.Head(code, location, bytes, type)
@@ -26,7 +27,10 @@ fun main() {
     check(result.first == UpdateRelease(version, "", apk, bytes))
     check(probe(latestReply, apk to response(200, bytes = 210, type = "application/vnd.android.package-archive")).first?.size == 210L)
     check(probe(latest to response(404)).let { it.first == null && it.second.contains("HTTP403") && it.second.contains("HTTP404") })
-    check(probe(latestReply, apk to response(404)).first == null)
+    val missingApk = apk to response(404)
+    check(probe(latestReply, missingApk, legacyApk to response(302, cdn),
+        cdn to response(200, bytes = bytes, type = "application/octet-stream")).first == UpdateRelease(version, "", legacyApk, bytes))
+    check(probe(latestReply, missingApk, legacyApk to response(404)).let { it.first == null && it.second.contains("HTTP404") })
     check(probe(latest to response(302, "/other/repo/releases/tag/$version")).first == null)
     check(probe(latest to response(302, "/$REPO/releases/tag/V2.0.0-beta")).first == null)
     check(probe(latest to response(302, "https://github.com.evil.example$tagPage")).first == null)
@@ -40,5 +44,14 @@ fun main() {
     }
     check(listOf(403, 429, 500, 502, 503, 504).all(PublicReleaseFallback::eligible))
     check(listOf(200, 401, 404, 501).none(PublicReleaseFallback::eligible))
-    println("官方发行页回退用例通过")
+    val current = "ASRtestII-1.10.0.apk"
+    val legacy = "ASRtestII.apk"
+    val other = "ASRtestII-1.9.0.apk"
+    fun select(tag: String, vararg names: String) = selectReleaseApk(tag, names.toList()) { it }
+    check(select(version, other, legacy, current) == current)
+    check(select("v1.10.0", other, current) == current)
+    check(select(version, other, legacy) == legacy)
+    check(select(version, "another.apk") == "another.apk")
+    check(select(version, other, "another.apk") == null)
+    println("发行APK选择和官方发行页回退用例通过")
 }
