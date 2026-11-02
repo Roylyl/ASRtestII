@@ -1,0 +1,54 @@
+# Generated Android/Java output and local tooling
+/build/
+/apk/
+/release/
+/dist/
+.gradle/
+.idea/
+.vscode/
+local.properties
+*.apk
+*.idsig
+*.aab
+*.class
+*.log
+__pycache__/
+.DS_Store
+Thumbs.db
+
+# Local signing keys, credentials and machine configuration
+/signing/
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.key
+*.pem
+.env
+.env.*
+*.dpapi
+
+# Private recordings, transcripts, device captures and run outputs
+/data/
+/recordings/
+*.wav
+*.flac
+*.mp3
+*.m4a
+*.pcm
+/tests/**/*.json
+/tests/**/*.jsonl
+/tests/**/*.csv
+/tests/**/*.png
+/tests/**/*.jpg
+/tests/**/*.zip
+/tests/**/*.xml
+!/tests/cloud-probe/AndroidManifest.xml
+/tests/*-classes/
+/tests/local-summary-probe/
+# Historical one-machine replay scripts contain local device and recording references
+/tests/build_vad_report.py
+/tests/english_probe.py
+/tests/english_phrase_probe.py
+/tests/vad_compare_phone.py
+/tests/vad_live_replay.py

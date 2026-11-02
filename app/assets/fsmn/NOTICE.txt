@@ -1,0 +1,5 @@
+FSMN-VAD GGUF model: FunAudioLLM/fsmn-vad-GGUF
+Source: https://huggingface.co/FunAudioLLM/fsmn-vad-GGUF/tree/6840bae4c5c92ee8c04faaf4db23dd0105098d7f
+Model card declares Apache-2.0. Refer to MODEL_LICENSE.txt.
+FSMN front end: Fun-ASR/runtime/llama.cpp, see CODE_LICENSE.txt.
+GGML runtime: llama.cpp/ggml, see GGML_LICENSE.txt.

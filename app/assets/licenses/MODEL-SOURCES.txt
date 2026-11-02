@@ -1,0 +1,4 @@
+Silero VAD ONNX: https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx
+Silero VAD upstream project: https://github.com/snakers4/silero-vad
+Silero VAD license: SILERO-VAD-LICENSE.txt; exporter/version of the downloaded artifact is not identified here.
+Vad.kt: copied from ASRtest/Vendor/sherpa-onnx/sherpa-onnx/kotlin-api/Vad.kt, copyright Xiaomi Corporation, Apache License 2.0; see SHERPA-ONNX-LICENSE.txt.

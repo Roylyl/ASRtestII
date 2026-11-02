@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="AppAlert" parent="@android:style/Theme.Material.Light.Dialog.Alert">
+        <item name="android:windowBackground">@drawable/dialog_card</item>
+        <item name="android:windowElevation">12dp</item>
+        <item name="android:backgroundDimAmount">0.32</item>
+        <item name="android:dialogPreferredPadding">22dp</item>
+        <item name="android:colorAccent">#006CDD</item>
+        <item name="android:textColorPrimary">#1C1C1E</item>
+        <item name="android:textColorSecondary">#5D5D65</item>
+        <item name="android:windowTitleStyle">@style/AppAlertTitle</item>
+        <item name="android:buttonBarPositiveButtonStyle">@style/AppAlertPrimary</item>
+        <item name="android:buttonBarNegativeButtonStyle">@style/AppAlertSecondary</item>
+        <item name="android:buttonBarNeutralButtonStyle">@style/AppAlertSecondary</item>
+    </style>
+    <style name="AppDestructiveAlert" parent="AppAlert">
+        <item name="android:colorAccent">#C62F29</item>
+    </style>
+    <style name="AppAlertTitle" parent="@android:style/TextAppearance.Material.Title">
+        <item name="android:textSize">20sp</item>
+        <item name="android:textStyle">bold</item>
+        <item name="android:textColor">#1C1C1E</item>
+    </style>
+    <style name="AppAlertSecondary" parent="@android:style/Widget.Material.Button.Borderless">
+        <item name="android:background">@drawable/dialog_secondary_button</item>
+        <item name="android:backgroundTint">@null</item>
+        <item name="android:textAllCaps">false</item>
+        <item name="android:textColor">#005EBF</item>
+        <item name="android:textSize">15sp</item>
+        <item name="android:letterSpacing">0</item>
+        <item name="android:minHeight">48dp</item>
+        <item name="android:minWidth">64dp</item>
+        <item name="android:paddingLeft">14dp</item>
+        <item name="android:paddingRight">14dp</item>
+    </style>
+    <style name="AppAlertPrimary" parent="AppAlertSecondary">
+        <item name="android:background">@drawable/dialog_primary_button</item>
+        <item name="android:textColor">#FFFFFF</item>
+        <item name="android:textStyle">bold</item>
+    </style>
+</resources>
