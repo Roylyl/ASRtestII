@@ -201,12 +201,20 @@ try {
             [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $dexFile.FullName,
                 $dexFile.Name, [IO.Compression.CompressionLevel]::Optimal) | Out-Null
         }
-        if (Test-Path -LiteralPath $assetsDirectory -PathType Container) {
-            foreach ($asset in (Get-ChildItem -LiteralPath $assetsDirectory -File -Recurse)) {
-                $relative = $asset.FullName.Substring($assetsDirectory.Length + 1).Replace('\', '/')
-                [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $asset.FullName,
-                    ('assets/' + $relative), [IO.Compression.CompressionLevel]::NoCompression) | Out-Null
-            }
+        # A file ignored by Git can still be present in a developer's checkout. Package
+        # the model inventory and its distribution notices, not arbitrary local assets.
+        $assetFiles = @($modelFiles) + @('fsmn/NOTICE.txt', 'fsmn/MODEL_LICENSE.txt',
+            'fsmn/CODE_LICENSE.txt', 'fsmn/GGML_LICENSE.txt')
+        $assetFiles += Get-ChildItem -LiteralPath (Join-Path $assetsDirectory 'licenses') -File -Recurse |
+            Where-Object { $_.Extension -in '.txt', '.md' } |
+            ForEach-Object { $_.FullName.Substring($assetsDirectory.Length + 1).Replace('\', '/') }
+        foreach ($relative in $assetFiles) {
+            [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, (Join-Path $assetsDirectory $relative),
+                ('assets/' + $relative), [IO.Compression.CompressionLevel]::NoCompression) | Out-Null
+        }
+        foreach ($notice in @('LICENSE', 'THIRD_PARTY_NOTICES.md')) {
+            [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, (Join-Path $PSScriptRoot $notice),
+                ('assets/licenses/' + $notice), [IO.Compression.CompressionLevel]::Optimal) | Out-Null
         }
         $nativeDirectory = Join-Path $appDirectory 'jni\arm64-v8a'
         if (Test-Path -LiteralPath $nativeDirectory -PathType Container) {

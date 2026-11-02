@@ -6,13 +6,15 @@
   <a href="https://github.com/Roylyl/ASRtestII/releases/latest"><img src="https://img.shields.io/github/v/release/Roylyl/ASRtestII?style=flat-square&amp;display_name=tag&amp;label=Release&amp;color=2563eb" alt="最新发行版本"></a>
   <a href="#安装与转写"><img src="https://img.shields.io/badge/Android-8.0%2B-27754d?style=flat-square&amp;logo=android&amp;logoColor=white" alt="Android 8.0及以上"></a>
   <a href="#安装与转写"><img src="https://img.shields.io/badge/ABI-arm64--v8a-526479?style=flat-square" alt="arm64-v8a架构"></a>
+  <a href="#许可证与第三方声明"><img src="https://img.shields.io/badge/Code%20license-Apache--2.0-485d75?style=flat-square" alt="项目原创代码采用Apache-2.0"></a>
   <a href="https://github.com/Roylyl/ASRtestII/releases"><img src="https://img.shields.io/github/downloads/Roylyl/ASRtestII/total?style=flat-square&amp;label=Downloads&amp;color=2563eb" alt="发行附件累计下载次数"></a>
   <a href="https://github.com/Roylyl/ASRtestII/stargazers"><img src="https://img.shields.io/github/stars/Roylyl/ASRtestII?style=flat-square&amp;label=Stars&amp;color=97752d" alt="GitHub Stars"></a>
 </p>
 <p align="center">
   <a href="https://github.com/Roylyl/ASRtestII/releases/latest">下载最新版</a> ·
   <a href="./使用说明.md">使用说明</a> ·
-  <a href="#从源码构建">从源码构建</a>
+  <a href="#从源码构建">从源码构建</a> ·
+  <a href="#许可证与第三方声明">许可证</a>
 </p>
 
 ## 安装与转写
@@ -86,4 +88,6 @@ pwsh -File .\Build-Apk.ps1 -Keystore "D:\keys\release.p12" -KeyAlias "release"
 
 </details>
 
-第三方模型与运行库的许可和来源见[模型许可目录](./app/assets/licenses/)及[FSMN说明](./app/assets/fsmn/NOTICE.txt)。
+## 许可证与第三方声明
+
+ASRtestII原创代码和原创文档采用[Apache License 2.0](./LICENSE)。模型、词表、预编译库和构建工具保留各自的许可。TEN VAD附有Agora部署限制；当前随APK分发的sherpa-onnx JNI还包含GPL许可的eSpeak NG代码。再分发时，请按对应组件阅读[第三方声明与源码索引](./THIRD_PARTY_NOTICES.md)。

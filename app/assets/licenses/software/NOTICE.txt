@@ -1,0 +1,53 @@
+随APK分发的软件
+
+本目录说明DEX与arm64-v8a本机库。模型与词表另见上一级模型说明。每项软件沿用各自的版权和许可。
+
+一、sherpa-onnx与JNI内含的代码
+
+app/src/com/k2fsa/sherpa/onnx目录中的9个Kotlin API文件、JNI中的sherpa-onnx代码来自k2-fsa/sherpa-onnx。上游为Apache-2.0，全文见../SHERPA-ONNX-LICENSE.txt。Vad.kt保留Xiaomi Corporation的版权行。OnlineRecognizer.kt删除了上游的示例模型预设，本地改动见文件头。JNI的版本字符串为1.13.8，提交字符串为11afbd00，对应上游v1.13.8。
+https://github.com/k2-fsa/sherpa-onnx/tree/11afbd009a7f8c08f4bcf2fc1b265d0df4670fbf/sherpa-onnx/kotlin-api
+
+当前libsherpa-onnx-jni.so编入TTS功能。库内有eSpeak NG引擎读取字典和检查语音数据版本的诊断文本，动态依赖表也没有独立的eSpeak库。上游将sherpa-onnx-core静态链接进JNI，TTS分支链接Piper并使用eSpeak NG。eSpeak NG及其构建配方链接的UCD Tools均为GPL-3.0-or-later，Unicode数据另依其数据许可。GPL许可全文见ESPEAK-GPL-3.0.txt。APK有无TTS入口不改变已分发的二进制内容。Piper的MIT许可和eSpeak工程中单独标注的BSD、Unicode、Apache条款见SHERPA-DEPENDENCY-NOTICES.txt。
+https://github.com/k2-fsa/sherpa-onnx/blob/v1.13.8/sherpa-onnx/jni/CMakeLists.txt
+https://github.com/k2-fsa/sherpa-onnx/blob/v1.13.8/sherpa-onnx/csrc/CMakeLists.txt
+https://github.com/csukuangfj/espeak-ng/blob/ed530aa113046142eb5115cf2fc9157854d0ffe1/README.md#license-information
+
+当前JNI可定位的源码与构建入口
+
+- sherpa-onnx完整源码。构建工作流和arm64构建脚本同在该修订。开关SHERPA_ONNX_ENABLE_TTS控制TTS。仓库的Build-Apk.ps1打包现有SO，未重新编译sherpa-onnx。
+  https://github.com/k2-fsa/sherpa-onnx/archive/11afbd009a7f8c08f4bcf2fc1b265d0df4670fbf.tar.gz
+  https://github.com/k2-fsa/sherpa-onnx/blob/v1.13.8/.github/workflows/android.yaml
+  https://github.com/k2-fsa/sherpa-onnx/blob/v1.13.8/build-android-arm64-v8a.sh
+- Piper音素转换源码和构建配置。该修订附uni-algo的声明。
+  https://github.com/csukuangfj/piper-phonemize/archive/f3ff95afc03640bc1399e113e83361192a2fafb4.tar.gz
+  https://github.com/k2-fsa/sherpa-onnx/blob/v1.13.8/cmake/piper-phonemize.cmake
+- eSpeak NG引擎、Unicode处理代码和上游字典源码。源码包中的src、dictsource、phsource及espeak-ng-data分别提供程序、字典编译输入、音素定义和语音数据。ASRTestII的app/assets没有单独随附espeak-ng-data目录或其编译字典。库中能识别读取此类数据的实现，现有记录不足以逐项确定二进制内部的生成数据。
+  https://github.com/csukuangfj/espeak-ng/archive/ed530aa113046142eb5115cf2fc9157854d0ffe1.tar.gz
+  https://github.com/csukuangfj/espeak-ng/tree/ed530aa113046142eb5115cf2fc9157854d0ffe1/src/ucd-tools
+  https://github.com/k2-fsa/sherpa-onnx/blob/v1.13.8/cmake/espeak-ng-for-piper.cmake
+- sherpa锁定的其他构建依赖见同修订的cmake目录。SHERPA-DEPENDENCY-NOTICES.txt逐项收录固定修订的版权或许可。包括Kaldi Decoder、kaldifst、OpenFst、Kaldi Native Fbank及KISS FFT、simple-sentencepiece及其中的Darts、hclust-cpp/fastcluster和nlohmann/json。Kaldi衍生代码保留相应原作者权利。fastcluster源文件另标注Copyright Christoph Dalitz, 2020及Daniel Müllner, 2011。
+  https://github.com/k2-fsa/sherpa-onnx/tree/v1.13.8/cmake
+
+取得源码。以上链接定位到与SO版本标识及上游配方相符的源码、配置和构建脚本。本仓库自身提供ASRTestII源码及APK打包脚本。当前JNI的逐次构建参数、补丁、生成输入及完整对应源码集合尚未整体核实，本仓库也未随JNI提供这个完整集合。分发含GPL组件的二进制时，发行者仍需落实GPL第5、6节等适用条款，确认所提供的是实际发行物的完整对应源码，并保证接收者可按所选方式取得。仅附许可文本或列出上游链接不能证明这一条件已经满足。
+https://www.gnu.org/licenses/gpl-3.0.html
+
+二、ONNX Runtime
+
+libonnxruntime.so的内嵌版本为1.28.2，构建提交为33ca962。Microsoft的MIT许可见ONNX-RUNTIME-LICENSE.txt。同修订的完整第三方声明见ONNX-RUNTIME-THIRD-PARTY-NOTICES.txt。该清单适用于上游项目，所列组件是否进入某个Android变体取决于其构建配置。
+https://github.com/microsoft/onnxruntime/tree/33ca962
+https://github.com/k2-fsa/sherpa-onnx/blob/v1.13.8/cmake/onnxruntime-android-aarch64.cmake
+
+三、FSMN前端、GGML和Android C++运行库
+
+libfsmn_vad.so使用native/fsmn/funasr_vad.h。该头文件对应Fun-ASR修订0339018，同修订的Apache-2.0全文见../../fsmn/CODE_LICENSE.txt。native/fsmn/ggml来自llama.cpp中的GGML，通用代码的MIT条款见../../fsmn/GGML_LICENSE.txt。CPU后端ops.cpp中的YaRN代码另标注Copyright (c) 2023 Jeffrey Quesnelle and Bowen Peng，适用MIT。仓库中的其他后端保留各自文件头，例如OpenVINO的Apache-2.0及SYCL部分代码的Apache-2.0 WITH LLVM-exception。本项目arm64构建记录启用ggml-cpu。
+https://github.com/QwenAudio/Fun-ASR/blob/0339018ba74a7defa3b6b6a96718d17b816be77b/LICENSE
+https://github.com/ggml-org/llama.cpp/tree/8086439a4cea94c71a5dfb8fe4ad1546aebd640f/ggml
+
+libc++_shared.so以及FSMN构建静态链接的NDK C++运行库来自Android NDK。ANDROID-LLVM-LICENSES.txt保留Android LLVM源树中的libc++、libc++abi、libunwind许可，含Apache-2.0 WITH LLVM-exception及上游保留的其他条款。取证使用本机NDK r29、ELF编译器标记与同修订的运行库许可。
+https://android.googlesource.com/toolchain/llvm-project/+/5e96669f06077099aa41290cdb4c5e6fa0f59349/
+
+四、Kotlin/JVM与JetBrains Annotations
+
+app/libs中的kotlin-stdlib-2.1.0.jar及annotations-13.0.jar作为D8输入，其类进入APK。JetBrains部分采用Apache-2.0，全文见../SHERPA-ONNX-LICENSE.txt。KOTLIN-JVM-NOTICES.txt包含Kotlin版权声明、GWT及Guava派生代码的声明、MathJVM.kt所用Boost数学代码的许可，以及在annotations同版本源码中出现的版权行。仅在宿主机运行的编译器等工具另见仓库third_party/licenses/NOTICE.txt。
+https://github.com/JetBrains/kotlin/blob/v2.1.0/license/README.md
+https://repo.maven.apache.org/maven2/org/jetbrains/annotations/13.0/annotations-13.0.pom

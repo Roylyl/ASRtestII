@@ -12,8 +12,21 @@ set(GGML_BLAS OFF CACHE BOOL "" FORCE)
 if(NOT DEFINED GGML_SOURCE_DIR)
   set(GGML_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ggml")
 endif()
+if(ANDROID AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  # Keep __FILE__ and DWARF paths relative for both JNI and static ggml objects.
+  add_compile_options(
+    "-ffile-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}=native/fsmn"
+    "-ffile-prefix-map=${GGML_SOURCE_DIR}=native/fsmn/ggml"
+    "-ffile-prefix-map=${CMAKE_CURRENT_BINARY_DIR}=build/fsmn"
+    "-ffile-prefix-map=${CMAKE_ANDROID_NDK}=android-ndk"
+    "-fdebug-compilation-dir=."
+  )
+endif()
 add_subdirectory("${GGML_SOURCE_DIR}" ggml-build)
 add_library(fsmn_vad SHARED fsmn_jni.cpp)
 target_link_libraries(fsmn_vad PRIVATE ggml log)
 target_compile_options(fsmn_vad PRIVATE -fvisibility=hidden)
 target_link_options(fsmn_vad PRIVATE "LINKER:--exclude-libs,ALL" "LINKER:-Bsymbolic-functions")
+if(ANDROID)
+  target_link_options(fsmn_vad PRIVATE "$<$<CONFIG:Release>:LINKER:--strip-debug>")
+endif()

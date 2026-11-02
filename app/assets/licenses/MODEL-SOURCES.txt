@@ -1,4 +1,68 @@
-Silero VAD ONNX: https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx
-Silero VAD upstream project: https://github.com/snakers4/silero-vad
-Silero VAD license: SILERO-VAD-LICENSE.txt; exporter/version of the downloaded artifact is not identified here.
-Vad.kt: copied from ASRtest/Vendor/sherpa-onnx/sherpa-onnx/kotlin-api/Vad.kt, copyright Xiaomi Corporation, Apache License 2.0; see SHERPA-ONNX-LICENSE.txt.
+ASRtestII随附模型与词表
+
+文件路径以APK内的assets目录为起点。每项许可分别适用于所列权重或词表。运行库和项目自身代码各自遵循其许可。
+
+1. X-ASR-zh-en｜中英文流式识别与热词
+
+文件：models/1920/encoder-1920ms.onnx、decoder-1920ms.onnx、joiner-1920ms.onnx、tokens.txt，以及同目录下的bpe.vocab。
+来源：GilgameshWind/X-ASR-zh-en官方1920ms流式FP32导出。前三个ONNX和tokens.txt来自同一chunk-1920ms-model目录。bpe.vocab由官方带标点SentencePiece模型bpe_punc.model导出为纯文本，5000项词元的顺序、文本和分数均与该模型一致。
+许可：模型卡声明Apache-2.0，完整条款见licenses/MODEL-APACHE-2.0.txt。bpe_punc.model由X-ASR项目在同一Apache-2.0许可证下发布。
+模型卡：https://huggingface.co/GilgameshWind/X-ASR-zh-en
+权重与tokens.txt：https://huggingface.co/GilgameshWind/X-ASR-zh-en/tree/main/deployment/models/chunk-1920ms-model
+分词模型：https://github.com/Gilgamesh-J/X-ASR/blob/main/X-ASR-zh-en/zipformer/data/lang_5000_with_punctuation/bpe_punc.model
+许可证：https://github.com/Gilgamesh-J/X-ASR/blob/main/LICENSE
+
+2. pyannote/segmentation-3.0｜说话人活动切分
+
+文件：models/pyannote-segmentation.onnx。
+来源：pyannote的segmentation-3.0权重，经k2-fsa转换为sherpa-onnx-pyannote-segmentation-3-0/model.onnx，打包时改名。ONNX内嵌模型名、原始模型卡及许可地址。
+许可：MIT，Copyright (c) 2023 CNRS。完整条款见licenses/PYANNOTE-SEGMENTATION-LICENSE.txt。通过原始Hugging Face仓库下载权重时，发布者要求登录并接受其访问条件。
+模型卡：https://huggingface.co/pyannote/segmentation-3.0
+转换与分发：https://k2-fsa.github.io/sherpa/onnx/speaker-diarization/models.html#sherpa-onnx-pyannote-segmentation-3-0
+原始许可证：https://huggingface.co/pyannote/segmentation-3.0/blob/main/LICENSE
+转换者所附许可副本：https://huggingface.co/csukuangfj/pyannote-models/blob/main/segmentation-3.0/LICENSE
+
+3. CAM++｜中英文声纹特征
+
+文件：models/campplus.onnx。
+来源：3D-Speaker团队的iic/speech_campplus_sv_zh_en_16k-common_advanced。ONNX内嵌此模型标识，原始检查点为campplus_cn_en_common.pt。k2-fsa分发的ONNX在本项目中改名。
+许可：该权重的ModelScope模型卡明确标为Apache License 2.0，完整条款见licenses/MODEL-APACHE-2.0.txt。
+模型卡：https://modelscope.cn/models/iic/speech_campplus_sv_zh_en_16k-common_advanced
+ONNX：https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx
+
+4. ERes2NetV2｜中文声纹特征
+
+文件：models/eres2netv2.onnx。
+来源：3D-Speaker团队的iic/speech_eres2netv2_sv_zh-cn_16k-common。ONNX内嵌此模型标识，原始检查点为pretrained_eres2netv2.ckpt。k2-fsa分发的ONNX在本项目中改名。
+许可：该权重的ModelScope模型卡明确标为Apache License 2.0，完整条款见licenses/MODEL-APACHE-2.0.txt。
+模型卡：https://modelscope.cn/models/iic/speech_eres2netv2_sv_zh-cn_16k-common
+ONNX：https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2netv2_sv_zh-cn_16k-common.onnx
+
+5. Silero VAD v4｜语音活动检测
+
+文件：models/silero_vad.onnx。
+来源：Silero Team。ONNX内嵌说明标明k2-fsa从v4导出，仅保留16kHz分支。
+许可：MIT，Copyright (c) 2020-present Silero Team。完整条款见licenses/SILERO-VAD-LICENSE.txt。
+原始版本与许可：https://github.com/snakers4/silero-vad/blob/v4.0/LICENSE
+ONNX：https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx
+
+6. TEN VAD｜语音活动检测
+
+文件：models/ten-vad.onnx。
+来源：TEN-framework/ten-vad，Copyright © 2025 Agora。k2-fsa分发的ONNX将音高特征置为0，文件内嵌了上游项目及许可地址。
+许可：Apache License 2.0附加Agora条件，见licenses/TEN-VAD-LICENSE.txt。附加条件限制与Agora竞争或允许第三方与其竞争的部署，并限定使用者应用和直接终端用户的受益范围。衍生作品沿用这些条件。上游对源自LPCNet的代码另列BSD声明，见licenses/TEN-VAD-NOTICES.txt。Apache-2.0全文见licenses/MODEL-APACHE-2.0.txt。
+上游许可证：https://github.com/TEN-framework/ten-vad/blob/main/LICENSE
+上游声明：https://github.com/TEN-framework/ten-vad/blob/main/NOTICES
+ONNX：https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/ten-vad.onnx
+
+7. FunASR FSMN-VAD｜语音活动检测
+
+文件：fsmn/fsmn-vad.gguf。
+来源：FunAudioLLM/fsmn-vad-GGUF，修订6840bae4c5c92ee8c04faaf4db23dd0105098d7f。发布者将其列为funasr/fsmn-vad的GGUF转换。
+许可：该GGUF模型卡与其链接的原始权重模型卡均声明Apache-2.0。模型许可全文见fsmn/MODEL_LICENSE.txt。前端和GGML代码的许可证另见fsmn/NOTICE.txt中列出的文件。
+GGUF模型卡：https://huggingface.co/FunAudioLLM/fsmn-vad-GGUF/blob/6840bae4c5c92ee8c04faaf4db23dd0105098d7f/README.md
+原始权重模型卡：https://huggingface.co/funasr/fsmn-vad
+
+运行库说明
+
+Vad.kt来自sherpa-onnx Kotlin API，版权归Xiaomi Corporation，许可为Apache-2.0，见licenses/SHERPA-ONNX-LICENSE.txt。

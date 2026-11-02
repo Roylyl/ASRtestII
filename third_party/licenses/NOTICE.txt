@@ -1,0 +1,39 @@
+仓库内构建工具和源码的分发说明
+
+一、Kotlin编译工具
+
+tools/kotlin中的8个JAR用于Windows独立编译。Build-Apk.ps1调用该目录的Kotlin编译器，D8另外读取app/libs。后者只含Kotlin标准库和JetBrains Annotations。下列工具的许可证适用于各自的JAR和其中对应的代码。
+
+tools/kotlin与app/libs同时包含
+
+- kotlin-stdlib-2.1.0.jar，org.jetbrains.kotlin:kotlin-stdlib:2.1.0。JetBrains标准库为Apache-2.0，部分JVM实现来自GWT、Guava及Boost。版权、许可及来源见app/assets/licenses/software/KOTLIN-JVM-NOTICES.txt。
+- annotations-13.0.jar，org.jetbrains:annotations:13.0。Apache-2.0。同版本源码含JetBrains和Sascha Weinreuter的版权行，均已收录在上述KOTLIN-JVM-NOTICES.txt中。
+  https://github.com/JetBrains/kotlin/tree/v2.1.0/libraries/stdlib
+  https://repo.maven.apache.org/maven2/org/jetbrains/annotations/13.0/
+
+仅用于宿主机编译
+
+- kotlin-compiler-embeddable-2.1.0.jar，org.jetbrains.kotlin:kotlin-compiler-embeddable:2.1.0。编译器自身为Apache-2.0。源码版的版权说明和索引分别见KOTLIN-JVM-NOTICES.txt及下列上游链接。编译器JAR还含重新命名包路径的第三方代码，例如ASM、IntelliJ、Google GWT/Guava、Dart衍生代码、Rhino、fastutil、Aalto XML、Stax2、Protocol Buffers、JDOM、JLine、Jansi、PicoContainer、Vavr、Log4j、StreamEx、javax.inject、Kotlin不可变集合以及LZ4 Java及其本机库。各部分仍受原条款约束，相关声明见KOTLIN-COMPILER-NOTICES.txt。其中Rhino部分保留上游Netscape Public License 1.1/GPL的说明，修改后的源文件可在同版本Kotlin的js/js.parser目录取得。
+  https://github.com/JetBrains/kotlin/blob/v2.1.0/license/README.md
+  https://github.com/JetBrains/kotlin/tree/v2.1.0/js/js.parser
+  https://repo.maven.apache.org/maven2/org/jetbrains/kotlin/kotlin-compiler-embeddable/2.1.0/
+- kotlin-daemon-embeddable-2.1.0.jar，org.jetbrains.kotlin:kotlin-daemon-embeddable:2.1.0。Kotlin编译守护进程，JetBrains部分为Apache-2.0。
+  https://repo.maven.apache.org/maven2/org/jetbrains/kotlin/kotlin-daemon-embeddable/2.1.0/
+- kotlin-script-runtime-2.1.0.jar，org.jetbrains.kotlin:kotlin-script-runtime:2.1.0。脚本运行时，JetBrains部分为Apache-2.0。
+  https://repo.maven.apache.org/maven2/org/jetbrains/kotlin/kotlin-script-runtime/2.1.0/
+- kotlin-reflect-1.6.10.jar，org.jetbrains.kotlin:kotlin-reflect:1.6.10。反射库为Apache-2.0，内含修改的Protocol Buffers代码。KOTLIN-COMPILER-NOTICES.txt保留该版本的上游版权、NOTICE与Protobuf的BSD声明。
+  https://github.com/JetBrains/kotlin/tree/v1.6.10/license
+  https://repo.maven.apache.org/maven2/org/jetbrains/kotlin/kotlin-reflect/1.6.10/
+- kotlinx-coroutines-core-jvm-1.6.4.jar，org.jetbrains.kotlinx:kotlinx-coroutines-core-jvm:1.6.4。Kotlin协程JVM运行库为Apache-2.0。
+  https://github.com/Kotlin/kotlinx.coroutines/tree/1.6.4
+- trove4j-1.0.20200330.jar，org.jetbrains.intellij.deps:trove4j:1.0.20200330。此JetBrains分支发布的POM指定LGPL-2.1，PrimeFinder和HashFunctions另有CERN声明。许可全文见TROVE4J-LGPL-2.1.txt和TROVE4J-CERN-NOTICE.txt，分支改动说明见TROVE4J-UPSTREAM-CHANGES.txt。随附trove4j-1.0.20200330-source.zip，取自同版本修订c08db9d8，包含库源码、生成器、构建脚本和上游许可。gradle.properties声明版本1.0.20200330，也可从Maven Central取得该版本的源代码JAR。该工具未列入app/libs或D8的输入。
+  https://github.com/JetBrains/intellij-deps-trove4j/tree/c08db9d834c03142d11435369446a978056c0da3
+  https://repo.maven.apache.org/maven2/org/jetbrains/intellij/deps/trove4j/1.0.20200330/
+
+上述Apache-2.0全文亦见app/assets/licenses/SHERPA-ONNX-LICENSE.txt。这里列出JAR本体、已识别的内含组件及可取得的上游通知。个别重新打包的类库没有独立版本标识，不能由外层Kotlin版本推断出每个内含组件的精确修订。
+
+二、仓库内的本机源码
+
+native/fsmn/funasr_vad.h来自Fun-ASR，适用app/assets/fsmn/CODE_LICENSE.txt中的Apache-2.0。native/fsmn/ggml的通用许可见app/assets/fsmn/GGML_LICENSE.txt。源树中的可选后端也随仓库分发，文件头的原始署名、许可证和例外条款应一并保留。例如llamafile/sgemm.cpp标注Mozilla Foundation的MIT条款，KleidiAI桥接代码标注Arm的MIT条款，OpenVINO部分文件标注Intel的Apache-2.0，SYCL部分文件标注Intel的MIT条款以及LLVM例外。这些目录出现在源码树中，当前FSMN的Android构建记录仅启用ggml-cpu且关闭GGML_LLAMAFILE及GGML_CPU_KLEIDIAI。随APK的实际运行库和第三方源码定位见app/assets/licenses/software/NOTICE.txt。
+https://github.com/QwenAudio/Fun-ASR/blob/0339018ba74a7defa3b6b6a96718d17b816be77b/runtime/llama.cpp/funasr-common/funasr_vad.h
+https://github.com/ggml-org/llama.cpp/tree/8086439a4cea94c71a5dfb8fe4ad1546aebd640f/ggml
