@@ -89,9 +89,8 @@ class CloudChatClient internal constructor(
      listOf("context_length_exceeded","maximum context length","maximum context window","max context","context window exceeded").any{it in error}
     } catch(_:Exception){false} else false
     checkCancelled()
-    val detail=when {
-     contextExceeded->"输入超过该云端模型的上下文限制，请分开导入后重试"
-     else->when(code){
+    if(contextExceeded)throw CloudContextLimitException()
+    val detail=when(code){
      in 300..399->"云端地址发生重定向，为保护API Key已拒绝，请填写最终接口地址"
      401,403->"云端认证失败，请检查API Key和模型访问权限"
      404->"云端接口不存在，请检查API地址"
@@ -100,7 +99,6 @@ class CloudChatClient internal constructor(
      429->"云端请求被限流或配额不足"
      in 500..599->"云端服务暂不可用（HTTP $code）"
      else->"云端请求失败（HTTP $code），请检查地址和模型配置"
-     }
     }
     throw IllegalStateException(detail)
    }

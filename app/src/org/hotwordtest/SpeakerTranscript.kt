@@ -7,7 +7,7 @@ import org.json.JSONObject
 /** Formats only speaker-aligned transcripts; original VAD text is never a fallback. */
 object SpeakerTranscript {
  private val groupId=Regex("S([1-9][0-9]*)")
- private val scopedId=Regex("说话人([1-9][0-9]*)（(?:本文件|本段)）")
+ private val scopedId=Regex("说话人([1-9][0-9]*)（(?:本窗口|本文件|本段)）")
  private val oldLocalId=Regex("本段说话人([1-9][0-9]*)")
  fun groupName(id:String):String=groupId.matchEntire(id)?.let{"说话人${it.groupValues[1]}"}?:id
 
@@ -66,7 +66,7 @@ object SpeakerTranscript {
  }
  fun line(startMs:Long,endMs:Long,label:String,text:String):String {
   if(text.isBlank())return ""
-  val speaker=singleLine(label).ifBlank{"说话人未识别"}
+  val speaker=TranscriptPresentation.cleanLabel(singleLine(label)).ifBlank{"说话人未识别"}
   return "[${timestamp(startMs)}–${timestamp(endMs)}]$speaker：${singleLine(text).trim()}"
  }
 

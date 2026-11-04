@@ -54,7 +54,7 @@ fun main(){
   val redirect=runCatching{client("redirect").complete("","hello",0){false}}.exceptionOrNull()
   check(redirect?.message?.contains("重定向")==true&&forwarded.get()==0)
   val context=runCatching{client("context").complete("","hello",0){false}}.exceptionOrNull()
-  check(context?.message?.contains("上下文") == true && context.message?.contains("super-secret")==false)
+  check(context is CloudContextLimitException && context.message?.contains("super-secret")==false)
   val cancel=AtomicBoolean(false)
   Thread{Thread.sleep(150);cancel.set(true)}.apply{isDaemon=true;start()}
   val cancelled=runCatching{client("slow").complete("","hello",0){cancel.get()}}.exceptionOrNull()

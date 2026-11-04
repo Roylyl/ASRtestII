@@ -129,6 +129,50 @@ object TimeAlignedAsr {
    return DiarizationTest.Session(assets,speakerKey,-1,speakerThreshold).also{diarizer=it}
   }
 
+  private var sharedVoiceGroups:LocalSpeakerTracker?=null
+  private fun voiceGroups():LocalSpeakerTracker? {
+   if(context==null)return null
+   return sharedVoiceGroups?:LocalSpeakerTracker(assets,speakerKey,speakerThreshold,decisionConfig).also{sharedVoiceGroups=it}
+  }
+  // Acoustic groups span a batch. Recency and diarizer IDs only apply within one WAV.
+  private inner class FileTurnLabels {
+   private var lastLocalId:Int?=null
+   private var lastGroup:String?=null
+   private var lastMatchedEnd=0
+   fun label(entry:JSONObject,turn:Turn):String {
+    val localId=turn.speakers.singleOrNull()
+    if(localId==null){
+     lastLocalId=null
+     return if(turn.speakers.isEmpty())"说话人未识别" else "多人重叠"
+    }
+    if(localId!=lastLocalId)lastGroup=null
+    lastLocalId=localId
+    val voice=entry.optJSONObject("voice_group_candidate")
+    var id=voice?.takeUnless{it.isNull("speaker_id")}?.getString("speaker_id")
+    if(id!=null){
+     lastGroup=id
+     lastMatchedEnd=turn.end
+    }else if(lastGroup!=null && turn.end-turn.start<RATE*3/2 && turn.start-lastMatchedEnd in 0..RATE*3){
+     val canExtend=when(voice?.optString("speaker_status")){
+      "insufficient_audio"->true
+      "weak_candidate_rejected"->voice.optString("best_existing_speaker_id")==lastGroup &&
+       voice.optInt("existing_group_count")==1 &&
+       voice.optDouble("similarity_to_previous",-1.0)>=decisionConfig.weakMatch-decisionConfig.ambiguityMargin
+      else->false
+     }
+     if(canExtend){
+      id=lastGroup
+      entry.put("speaker_continuity",JSONObject().put("method","short_nearby_same_diarizer_track").put("speaker_id",id))
+     }
+    }
+    val identity=entry.optJSONObject("wearer_identity")
+    if(identity?.optString("status")=="wearer_candidate"&&!identity.isNull("display_name")){
+     identity.optString("display_name").takeIf{it.isNotBlank()}?.let{return it}
+    }
+    return id?.let(SpeakerTranscript::groupName)?:"说话人未识别"
+   }
+  }
+
   private fun transcribeTurn(samples:FloatArray,turn:Turn,cancelled:()->Boolean):JSONObject {
    if(cancelled())throw InterruptedException("已停止")
    val stream=recognizer.createStream(hotwords)
@@ -185,7 +229,8 @@ object TimeAlignedAsr {
    // an experimental voice comparison. Failure does not discard the original ASR.
    val matcher=if(context==null)null else try{WearerVoiceStore.Matcher(context,speakerKey)}catch(_:Exception){null}
    // Independent from pyannote speaker IDs; disabled for batch/probe callers without a UI context.
-   val voiceGroups=if(context==null)null else try{LocalSpeakerTracker(assets,speakerKey,speakerThreshold,decisionConfig)}catch(_:Exception){null}
+   val fileLabels=FileTurnLabels()
+   val voiceGroups=try{voiceGroups()}catch(e:Exception){Log.w("HotwordTest","无法初始化声纹归组",e);null}
    try {
     for(turn in intervals){
      val entry=transcribeTurn(samples,turn,cancelled)
@@ -200,48 +245,26 @@ object TimeAlignedAsr {
        catch(_:Exception){JSONObject().put("status","comparison_failed")}
       entry.put("wearer_identity",identity)
      }
+     if(context!=null)entry.put("speaker_display",fileLabels.label(entry,turn))
      turns.put(entry)
      progress?.onTurn(turns.length(),intervals.size,entry)
     }
-   } finally {try{matcher?.close()}finally{voiceGroups?.close()}}
+   } finally {matcher?.close()}
    if(voiceGroups!=null){
     progress?.onGrouping()
-    val observations=(0 until turns.length()).map { i ->
-     val turn=turns.getJSONObject(i);val ids=turn.getJSONArray("speaker_candidates");val candidate=turn.optJSONObject("voice_group_candidate")
-     fun number(key:String):Double?=if(candidate==null||candidate.isNull(key))null else candidate.optDouble(key,Double.NaN).takeIf{it.isFinite()}
-     OfflineSpeakerGrouping.Observation(turn.getLong("start_ms"),turn.getLong("end_ms"),(0 until ids.length()).map{ids.getInt(it)},turn.optString("text").isNotBlank(),
-      if(candidate==null||candidate.isNull("speaker_id"))null else candidate.optString("speaker_id"),candidate?.optString("speaker_status")?:"",candidate?.optString("candidate_kind")?:"",candidate?.optString("decision")?:"",number("similarity_to_previous"),number("candidate_margin"))
-    }
-    val grouping=OfflineSpeakerGrouping.assign(observations,OfflineSpeakerGrouping.Config(margin=decisionConfig.ambiguityMargin))
-    val windowLocal=diarization.optString("processing_mode")=="single_window_segmentation_only"
-    val msByCategory=linkedMapOf<String,Long>();val rowsByCategory=linkedMapOf<String,Int>()
-    for(i in observations.indices){
-     val turn=turns.getJSONObject(i);val observation=observations[i];val assignment=grouping.assignments[i]
-     val identity=turn.optJSONObject("wearer_identity")
-     val registered=if(identity?.optString("status")=="wearer_candidate"&&!identity.isNull("display_name"))identity.optString("display_name").takeIf{it.isNotBlank()} else null
-     val display=OfflineSpeakerGrouping.display(observation,assignment,registered,windowLocal)
-     if(observation.textPresent){val duration=(observation.endMs-observation.startMs).coerceAtLeast(0);msByCategory[display.category]=(msByCategory[display.category]?:0L)+duration;rowsByCategory[display.category]=(rowsByCategory[display.category]?:0)+1}
-     val mapped=JSONArray();assignment.groups.forEach{mapped.put(it?:JSONObject.NULL)}
-     val reasons=JSONArray();assignment.reasons.forEach{reasons.put(it)}
-     turn.put("speaker_display",display.label).put("offline_voice_groups",mapped).put("offline_voice_group_reasons",reasons).put("offline_voice_display_category",display.category)
-    }
-    val msJson=JSONObject();msByCategory.forEach{(k,v)->msJson.put(k,v)};val rowJson=JSONObject();rowsByCategory.forEach{(k,v)->rowJson.put(k,v)}
-    out.put("offline_voice_grouping",JSONObject().put("method","repeated_strong_evidence_and_conservative_mapping_v1")
-     .put("stable_group_count",grouping.stableGroups.size).put("direct_strong",SpeakerDefaults.OFFLINE_DIRECT_STRONG).put("direct_weak",SpeakerDefaults.OFFLINE_DIRECT_WEAK).put("direct_margin",decisionConfig.ambiguityMargin).put("stable_observations",SpeakerDefaults.STABLE_OBSERVATIONS).put("stable_duration_ms",SpeakerDefaults.STABLE_DURATION_MS).put("text_row_duration_ms_by_category",msJson).put("text_rows_by_category",rowJson)
-     .put("note","仅统计有文字行，按原切分边界计算；已登记名称为候选非确认身份；本窗口编号不表示全文件声纹聚类；重叠及未归组不等于实际人数"))
+    out.put("offline_voice_grouping",JSONObject().put("method","threshold_gated_cross_clip_embedding_v2")
+     .put("new_speaker_max_similarity",decisionConfig.newSpeakerMax).put("strong_match",decisionConfig.strongMatch)
+     .put("weak_match",decisionConfig.weakMatch).put("raw_window_ids_used_for_identity",false))
    }
    val turnsEnded=SystemClock.elapsedRealtimeNanos()
    out.put("speaker_turn_transcripts",turns)
     .put("speaker_turn_alignment_status","speaker_activity_intervals_independent_asr")
     .put("speaker_turn_note","按VAD与说话人活动的并集切分音频并独立转写；仅为模型预测，重叠及短片段可能丢字，原VAD转写保留在asr_segments")
-    .put("voice_group_candidate_scope","声纹分组S编号独立于说话人切分编号，不可视为同一编号；只匹配此前已有分组，重叠不分配")
+    .put("voice_group_candidate_scope","同一任务内跨文件按声纹归组。只有足够清晰且与已有声纹差异足够大的单人语音才能新建分组，重叠片段不创建人物。")
     .put("speaker_turn_process_ms",(turnsEnded-turnsStarted)/1000000.0)
    if(voiceGroups!=null){
-    try {
-     val refinement=OfflineVoiceRecluster.apply(assets,samples,out,speakerKey,decisionConfig,cancelled)
-     out.put("offline_voice_recluster",refinement)
-    } catch(e:java.util.concurrent.CancellationException){throw e}
-      catch(e:Exception){out.put("offline_voice_recluster",JSONObject().put("status","failed").put("reason",e.message?:"声纹分组失败"))}
+    out.put("speaker_identity_status","task_scoped_voice_group_and_enrollment_predictions")
+    out.put("offline_voice_recluster",JSONObject().put("status","skipped").put("reason","threshold_gated_session_grouping_authoritative"))
    }
    out.put("diarization_source",if(cachedDiarization==null)"computed" else "reused")
     .put("diarization_cache_source_group",cachedSourceGroup?:JSONObject.NULL)
@@ -257,7 +280,9 @@ object TimeAlignedAsr {
      else "total_ms为本次VAD、转写和逐片段转写耗时，不含来源任务的说话人切分；非完整链路耗时或实时延迟")
    return out
   }
-  override fun close(){try{diarizer?.close()}finally{recognizer.release()}}
+  override fun close(){
+   try{sharedVoiceGroups?.close()}finally{try{diarizer?.close()}finally{recognizer.release()}}
+  }
  }
  fun process(assets:AssetManager,samples:FloatArray,modelDir:File,speakerKey:String,
              hotwords:String="",vadKey:String=VadModelFactory.SILERO,cancelled:()->Boolean={false},

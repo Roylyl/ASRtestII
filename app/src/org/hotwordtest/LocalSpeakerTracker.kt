@@ -81,6 +81,7 @@ class LocalSpeakerTracker(assets: AssetManager, modelKey: String = SpeakerModels
   }
   val gap=if(scores.size>1)best.second-scores[1].second else null
   out.put("similarity_to_previous",best.second).put("candidate_margin",gap?:JSONObject.NULL)
+   .put("best_existing_speaker_id","S${best.first+1}").put("existing_group_count",references.size)
   if(best.second>=matchThreshold&&(gap==null||gap>=decisionConfig.ambiguityMargin)){
    if(strong){
     val count=counts[best.first];val old=references[best.first]

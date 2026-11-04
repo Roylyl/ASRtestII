@@ -27,12 +27,12 @@ object OfflineSpeakerGrouping {
   val assigned=a.groups.mapNotNull{it}
   fun name(g:String)="说话人"+g.removePrefix("S")
   if(o.rawIds.size>1){
-   if(windowLocal)return Display("重叠："+o.rawIds.distinct().joinToString("、"){"说话人${it+1}（本窗口）"},"overlap")
+   if(windowLocal)return Display("重叠："+o.rawIds.distinct().joinToString("、"){"说话人${it+1}"},"overlap")
    val known=assigned.distinct().map(::name);return Display(if(known.isEmpty())"多人重叠，身份待确认" else "重叠："+(known+if(a.groups.any{it==null})listOf("另有未归组声音") else emptyList()).joinToString("、"),"overlap")
   }
   if(o.rawIds.size==1 && !registeredName.isNullOrBlank())return Display(registeredName,"registered_candidate")
   if(o.rawIds.size==1 && assigned.size==1)return Display(name(assigned.single()),"grouped")
-  if(o.rawIds.size==1 && windowLocal)return Display("说话人${o.rawIds.single()+1}（本窗口）","window_local")
+  if(o.rawIds.size==1 && windowLocal)return Display("说话人${o.rawIds.single()+1}","window_local")
   return Display("说话人待确认","ungrouped")
  }
  fun assign(input:List<Observation>,config:Config=Config()):Result {

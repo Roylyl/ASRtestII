@@ -31,7 +31,7 @@ class MainActivity:Activity(){
  private val cloudSettings by lazy { CloudSettings(applicationContext) }
  private val updateUi by lazy { UpdateUi(this) }
  private val active=AtomicBoolean(false); @Volatile private var destroyed=false; @Volatile private var diarizationRunning=false
- private var page=0; private var status="准备就绪"; private var transcript:CharSequence="点击开始识别，模型准备完成后即可说话。"; @Volatile private var startRequested=false
+ private var page=0; private var status="准备就绪"; private var transcript:CharSequence="点击“开始手机录音”，或导入WAV/ZIP。"; @Volatile private var startRequested=false
  private var instantPreview=""
  private lateinit var instantView:TextView
  private var polishText="完成转写后，可使用设置中的云端模型勘误。"
@@ -46,7 +46,7 @@ class MainActivity:Activity(){
  @Volatile private var reviewRows:List<TranscriptReview.Row> = emptyList()
  private var polishWorker:Thread?=null
 
- private var recognitionSource=""
+ private var recognitionSource="手机麦克风或导入文件"
  private var reviewNote=""
  private fun sourceStatus(value:String)=(if(recognitionSource.isEmpty())value else "来源：$recognitionSource · $value")+
   if(reviewNote.isEmpty())"" else " · $reviewNote"
@@ -93,12 +93,16 @@ class MainActivity:Activity(){
   runOnUiThread{if(!destroyed){change();refreshPolishUi()}}
  }
 
+ private fun displayRows(rows:List<TranscriptReview.Row>):List<TranscriptReview.Row>{
+  val names=TranscriptPresentation.Names()
+  return rows.map{it.copy(prefix=names.line(it.prefix))}
+ }
  private fun startPolish(){
   if(!idleForReview())return
   val settings=cloudSettings.summary()
   if(!cloudReady(settings)){offerCloudSettings();return}
   if(!hasReviewMaterial())return
-  val rows=reviewRows
+  val rows=displayRows(reviewRows)
   val target=settings.endpoint to settings.model
   val previous=reusableEdit(target)
   polishRunning=true
@@ -109,7 +113,6 @@ class MainActivity:Activity(){
   polishWorker=Thread{
    val cancelled={destroyed || Thread.currentThread().isInterrupted}
    var correction=previous
-   val finishedSummaries=mutableListOf<String>()
    try{
     val client=CloudChatClient(cloudSettings)
     var correctionPart=""
@@ -117,9 +120,14 @@ class MainActivity:Activity(){
      thinking={val hint="${correctionPart}模型正在思考勘误内容…";updatePolishUi{polishText=hint}},
      writing={val hint="${correctionPart}正在接收校对结果…";updatePolishUi{polishText=hint}}
     )
-    val correct=TranscriptReview.Completion {system,user,stop->client.complete(system,user,0,stop,correctionProgress).text}
-    val edited=previous?:TranscriptReview.correct(correct,rows,cancelled){i,total->
-     correctionPart=if(total==1)"" else "第${i}/${total}份 · "
+    val correct=TranscriptReview.Completion {system,user,stop->
+     android.util.Log.i("CloudReview","task=correction request chars="+user.length)
+     val response=client.complete(system,user,0,stop,correctionProgress)
+     android.util.Log.i("CloudReview","task=correction completed reasoning="+response.reasoningContentPresent+" prompt_tokens="+response.promptTokens)
+     response.text
+    }
+    val edited=previous?:TranscriptReview.correct(correct,rows,cancelled){_,total->
+     correctionPart=if(total==1)"" else "全文超出上下文，分块处理 · "
      val hint="${correctionPart}正在结合全文勘误…"
      updatePolishUi{polishText=hint}
     }
@@ -131,31 +139,28 @@ class MainActivity:Activity(){
      polishPhase=2
      summaryText="正在根据勘误稿生成内容摘要…"
     }
-    val files=edited.rows.groupBy{it.source}
-    for((index,file) in files.entries.withIndex()){
-     val prior=if(finishedSummaries.isEmpty())"" else "已完成\n"+finishedSummaries.joinToString("\n\n")+"\n\n"
-     val label=if(files.size==1)"摘要" else "第${index+1}/${files.size}份摘要"
-     val name=if(file.key.isEmpty())"" else "【${file.key}】\n"
-     val partial=StringBuilder()
-     var nextPreview=0L
-     val progress=CloudChatClient.Progress(
-      thinking={updatePolishUi{summaryText="${prior}${label} · 正在梳理内容…\n$name"}},
-      content={delta->
-       partial.append(delta)
-       val now=android.os.SystemClock.elapsedRealtime()
-       if(now>=nextPreview){
-        nextPreview=now+180
-        val preview="${prior}${label} · 正在生成\n$name$partial"
-        updatePolishUi{summaryText=preview}
-       }
-      }
-     )
-     val summarize=TranscriptReview.Completion {system,user,stop->client.complete(system,user,0,stop,progress).text}
-     finishedSummaries+=TranscriptReview.summarize(summarize,file.value,cancelled){
-      updatePolishUi{summaryText="${prior}${label} · 等待云端响应…\n$name"}
+    val partial=StringBuilder()
+    var nextPreview=0L
+    val progress=CloudChatClient.Progress(
+     thinking={updatePolishUi{summaryText="模型正在结合全部内容深度思考总体摘要…"}},
+     content={delta->
+      partial.append(delta)
+      val now=android.os.SystemClock.elapsedRealtime()
+      if(now>=nextPreview){nextPreview=now+180;val preview=partial.toString();updatePolishUi{summaryText=preview}}
      }
+    )
+    val summarize=TranscriptReview.Completion {system,user,stop->
+     partial.setLength(0)
+     android.util.Log.i("CloudReview","task=summary request chars="+user.length)
+     val response=client.complete(system,user,0,stop,progress)
+     android.util.Log.i("CloudReview","task=summary completed reasoning="+response.reasoningContentPresent+" prompt_tokens="+response.promptTokens)
+     response.text
     }
-    val summary=finishedSummaries.joinToString("\n\n")
+    val extract=TranscriptReview.Completion {system,user,stop->
+     android.util.Log.i("CloudReview","task=summary_internal request chars="+user.length)
+     client.complete(system,user,0,stop,CloudChatClient.Progress(thinking={})).text
+    }
+    val summary=TranscriptReview.summarize(summarize,edited.rows,cancelled,{hint->updatePolishUi{summaryText=hint}},extract)
     updatePolishUi{summaryText=summary;completedEdit=edited;editTarget=target}
    }catch(e:Throwable){
     val completed=correction
@@ -163,8 +168,7 @@ class MainActivity:Activity(){
      if(completed==null){polishText="勘误未完成：${e.message?:e.javaClass.simpleName}";summaryText="等待勘误完成。"}
      else{
       completedEdit=completed;editTarget=target
-      val prior=if(finishedSummaries.isEmpty())"" else "已完成\n"+finishedSummaries.joinToString("\n\n")+"\n\n"
-      summaryText="${prior}摘要未完成：${e.message?:e.javaClass.simpleName}。再次点击可重试摘要。"
+      summaryText="摘要未完成：${e.message?:e.javaClass.simpleName}。再次点击可重试摘要。"
      }
     }
    }finally{updatePolishUi{polishRunning=false;polishPhase=0;polishWorker=null}}
@@ -359,17 +363,52 @@ class MainActivity:Activity(){
   }
   return output
  }
+ private var expandedKind:String?=null
+ private var expandedOutput:TextView?=null
+ private fun expandedValue(kind:String):String=when(kind){
+  "识别结果"->resultView.text.toString()
+  "转写勘误"->if(::polishResultView.isInitialized)polishResultView.text.toString() else polishText
+  else->summaryText
+ }
+ private fun refreshExpanded(){
+  val view=expandedOutput?:return
+  val value=expandedValue(expandedKind?:return)
+  if(view.text.toString()!=value)view.text=value
+ }
+ private fun openExpanded(kind:String){
+  val output=text(expandedValue(kind),17,Color.BLACK).apply{
+   setTextIsSelectable(true);setPadding(dp(20),dp(8),dp(20),dp(16));setLineSpacing(dp(5).toFloat(),1f)
+  }
+  val scroll=ScrollView(this).apply{addView(output);isFillViewport=true}
+  val host=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL;addView(scroll,LinearLayout.LayoutParams(-1,dp((resources.configuration.screenHeightDp*0.68f).toInt())))}
+  val dialog=hapticDialog().setTitle(kind).setView(host)
+   .setNeutralButton("复制全部"){d,_->dialogTap(d)
+    val value=expandedValue(kind)
+    getSystemService(android.content.ClipboardManager::class.java).setPrimaryClip(android.content.ClipData.newPlainText(kind,value))
+    Toast.makeText(this,"已复制",Toast.LENGTH_SHORT).show()
+   }.setPositiveButton("关闭"){d,_->dialogTap(d)}.create()
+  expandedKind=kind;expandedOutput=output
+  dialog.setOnDismissListener{expandedOutput=null;expandedKind=null}
+  dialog.show()
+ }
+ private fun resultHeading(title:String):LinearLayout=LinearLayout(this).apply{
+  orientation=LinearLayout.HORIZONTAL;gravity=Gravity.CENTER_VERTICAL
+  addView(text(title,18,Color.BLACK).apply{setTypeface(null,Typeface.BOLD)},LinearLayout.LayoutParams(0,-2,1f))
+  addView(text("展开",14,blue).apply{
+   minWidth=dp(48);minHeight=dp(44);gravity=Gravity.CENTER;contentDescription="展开$title";onHapticClick{openExpanded(title)}
+  },LinearLayout.LayoutParams(-2,-2))
+ }
  private fun showTest(){
   val screenHeight=resources.configuration.screenHeightDp
   val recognition=card()
-  recognition.addView(text("识别结果",18,Color.BLACK).apply{setTypeface(null,Typeface.BOLD)})
+  recognition.addView(resultHeading("识别结果"))
   statusView=text(sourceStatus(status),13,blue).apply{setPadding(0,dp(4),0,0)}
   recognition.addView(statusView)
   instantView=text(instantPreview,16,Color.DKGRAY).apply{visibility=if(instantPreview.isEmpty())View.GONE else View.VISIBLE}
   recognition.addView(instantView)
-  resultView=addResultBox(recognition,transcript.toString(),(screenHeight/4).coerceIn(112,176),true)
+  resultView=addResultBox(recognition,TranscriptPresentation.render(transcript.toString()),(screenHeight/4).coerceIn(112,176),true)
   val actions=LinearLayout(this).apply{orientation=LinearLayout.HORIZONTAL}
-  recordAction=button(if(active.get()||startRequested)"结束识别" else "开始识别",true){
+  recordAction=button(if(active.get()||startRequested)"结束识别" else "开始手机录音",true){
    if(active.get()||startRequested)stop() else requestStart()
   }
   importAction=button("导入WAV/ZIP"){selectFile()}
@@ -387,10 +426,7 @@ class MainActivity:Activity(){
   }
   language.addView(draftAction)
   fun stage(title:String,value:String):TextView{
-   val heading=text(title,15,Color.BLACK).apply{
-    setTypeface(null,Typeface.BOLD)
-    setPadding(0,dp(12),0,dp(6))
-   }
+   val heading=resultHeading(title).apply{setPadding(0,dp(8),0,0)}
    language.addView(heading)
    val panel=LinearLayout(this).apply{
     orientation=LinearLayout.VERTICAL
@@ -422,13 +458,14 @@ class MainActivity:Activity(){
    else->if(reusable)"重新生成摘要" else "开始勘误并总结"
   }
   val recognizing=active.get()||startRequested||diarizationRunning
-  recordAction.text=if(recognizing)"结束识别" else "开始识别"
+  recordAction.text=if(recognizing)if(recognitionSource=="手机麦克风")"结束手机录音" else "停止识别" else "开始手机录音"
   draftAction.text=if(readingDraft)"正在读取勘误稿…" else "打开已有勘误稿"
   draftAction.isEnabled=idleForReview()
   recordAction.isEnabled=!readingDraft&&!polishRunning&&(!recognitionBusy||recognizing)
   importAction.isEnabled=!readingDraft&&!polishRunning&&!recognizing&&!recognitionBusy
   polishAction.isEnabled=idleForReview()&&(hasReviewMaterial()||!cloudReady(settings))
   listOf(recordAction,importAction,polishAction,draftAction).forEach{it.alpha=if(it.isEnabled)1f else 0.45f}
+  refreshExpanded()
  }
  private fun decodeSpeakerTurn(engine:OnlineRecognizer,hotwords:String?,samples:FloatArray):String {
   val stream=engine.createStream(hotwords?:"")
@@ -447,12 +484,13 @@ class MainActivity:Activity(){
   val local=linkedMapOf<Int,String>();val globalByLocal=mutableMapOf<Int,String>();val conflicted=mutableSetOf<Pair<Int,Int>>()
   for(id in out.turns.flatMap{it.localIds}.distinct().sorted()){
    val clean=items.filter{it.first.localIds==listOf(id)&&it.second.isNotBlank()}.map{it.first.audio}
-   val size=clean.sumOf{it.size};var label="说话人${id+1}"
+   val size=clean.sumOf{it.size};var label="说话人未识别"
    if(size>=16000&&speaker!=null){
     val audio=FloatArray(size);var pos=0;for(part in clean){part.copyInto(audio,pos);pos+=part.size}
     val prior=speaker.snapshotAnonymousGroups()
     val voice=try{speaker.classify(audio,true)}catch(_:Exception){speaker.restoreAnonymousGroups(prior);null}
     val sp=voice?.optJSONObject("speaker")
+    if(voice?.optJSONObject("identity")?.optString("status")=="wearer_candidate")label=voice.optString("display").ifBlank{label}
     if(sp!=null&&!sp.isNull("speaker_id")){
      val group=sp.getString("speaker_id")
      val collision=globalByLocal.filter{(other,g)->g==group&&out.turns.any{it.localIds.contains(id)&&it.localIds.contains(other)}}.keys
@@ -468,9 +506,9 @@ class MainActivity:Activity(){
   }
   val rows=org.json.JSONArray()
   for((turn,text) in items){
-   val names=turn.localIds.map{local[it]?:"说话人${it+1}"}
+   val names=turn.localIds.map{local[it]?:"说话人未识别"}
    val collision=turn.localIds.indices.any{i->turn.localIds.indices.any{j->i<j&&conflicted.contains(minOf(turn.localIds[i],turn.localIds[j]) to maxOf(turn.localIds[i],turn.localIds[j]))}}
-   val display=when(names.size){0->"说话人未识别";1->names[0];else->if(collision||names.distinct().size<names.size)"多人重叠，归属未区分" else "重叠："+names.joinToString("、")}
+   val display=when(names.size){0->"说话人未识别";1->names[0];else->if(collision||names.distinct().size<names.size)"多人重叠，归属未区分" else "重叠："+names.joinToString("、"){if(it=="说话人未识别")"另有未归组声音" else it}}
    val ids=org.json.JSONArray();turn.localIds.forEach{ids.put(it)}
    rows.put(org.json.JSONObject().put("start_sample",turn.start).put("end_sample",turn.end)
     .put("start_ms",turn.start*1000/16000).put("end_ms",turn.end*1000/16000)
@@ -566,9 +604,9 @@ class MainActivity:Activity(){
    display(item,saved);content.addView(c)
   }
   addSetting("speaker_match_threshold","已有说话人匹配下限",
-   "相似度达到此值才可能归入已有声纹候选组。离线最终显示还需通过独立的可信度筛选。",SpeakerDefaults.MATCH_PERCENT)
+   "声纹相似度达到此值时可匹配已有说话人。已有多组时，还要比较最接近的两组得分。",SpeakerDefaults.MATCH_PERCENT)
   addSetting("speaker_new_max_similarity","新建说话人相似度上限",
-   "只控制声纹候选组的新建，不直接限制pyannote切分的说话人人数。数值越低，新建越严格。",SpeakerDefaults.NEW_MAX_PERCENT)
+   "声纹相似度低于此值时才允许新建匿名说话人。数值越低，新建越严格。",SpeakerDefaults.NEW_MAX_PERCENT)
   addSetting("speaker_min_margin","多个说话人最小分差",
    "已有多个候选组时，最佳与次佳相似度至少相差此值；也用于离线最终归组筛选。",SpeakerDefaults.MARGIN_PERCENT)
   addSetting("speaker_group_threshold","说话人切分聚类阈值",
@@ -641,7 +679,7 @@ class MainActivity:Activity(){
 
   val speaker=section("说话人与声纹")
   toggle(speaker,"本地声纹区分（实验）","speaker_enabled")
-  note(speaker,"需开启VAD。匿名编号显示为“说话人1”“说话人2”等。“本段”编号仅在当前片段内有效，“本文件”编号仅在当前录音文件内有效。登记姓名也可能误判。")
+  note(speaker,"需开启VAD。匿名编号显示为“说话人1”“说话人2”等。编号按本次识别结果的首次出现顺序排列。登记姓名也可能误判。")
   toggle(speaker,"细分连续说话人（实验）","live_speaker_turns")
   note(speaker,"需同时开启VAD和声纹区分。连续发言会按人细分，处理耗时可能增加。")
   action(speaker,"声纹模型：${SpeakerModels.name(selectedSpeakerModel())}"){chooseSpeakerModel()}
@@ -656,7 +694,7 @@ class MainActivity:Activity(){
   updateUi.addTo(section("软件更新"))
  }
  private fun setStatus(v:String){status=v;runOnUiThread{if(!destroyed&&page==0&&::statusView.isInitialized)statusView.text=sourceStatus(v)}}
- private fun setResult(v:String){runOnUiThread{transcript=v;if(!destroyed&&page==0&&::resultView.isInitialized)resultView.text=v}}
+ private fun setResult(v:String){runOnUiThread{transcript=v;if(!destroyed&&page==0&&::resultView.isInitialized)resultView.text=TranscriptPresentation.render(v);refreshExpanded()}}
  private fun showInstantPreview(value:String){
   if(instantPreview==value)return
   instantPreview=value
@@ -729,7 +767,7 @@ class MainActivity:Activity(){
     outcome.put("speaker_decision_config",speakerDecisionJson(decisionConfig))
     if(!startRequested)throw InterruptedException("已停止")
     val runs=File(getExternalFilesDir(null),"runs");runs.mkdirs()
-    val result=SpeakerTranscript.aligned(outcome)
+    val result=TranscriptPresentation.render(SpeakerTranscript.aligned(outcome))
     outcome.put("transcript_text",result).put("transcript_scope","speaker_turns_only")
     val runName="aligned-${System.currentTimeMillis()}"
     File(runs,"$runName.json").writeText(outcome.toString())
@@ -764,7 +802,7 @@ class MainActivity:Activity(){
     val singleWindow=outcome.getString("processing_mode")=="single_window_segmentation_only"
     out.append(if(singleWindow)"不超过10秒：仅切分，未执行声纹聚类；编号为窗口内局部编号。\n\n" else "多窗口处理：已配置${SpeakerModels.name(model)}，是否实际进入声纹聚类取决于音频检测结果；编号为匿名编号。\n\n")
     if(segments.length()==0)out.append("未检测到说话人\n")
-    for(i in 0 until segments.length()){val a=segments.getJSONObject(i);val start=String.format(java.util.Locale.ROOT,"%.2f",a.getDouble("start_seconds"));val end=String.format(java.util.Locale.ROOT,"%.2f",a.getDouble("end_seconds"));out.append("[$start—${end}秒]说话人${a.getInt("speaker_id")+1}（${if(singleWindow)"本窗口" else "本文件"}）\n")}
+    for(i in 0 until segments.length()){val a=segments.getJSONObject(i);val start=String.format(java.util.Locale.ROOT,"%.2f",a.getDouble("start_seconds"));val end=String.format(java.util.Locale.ROOT,"%.2f",a.getDouble("end_seconds"));out.append("[$start—${end}秒]说话人${a.getInt("speaker_id")+1}\n")}
     setResult(out.toString());setStatus("本地切分完成 · ${if(singleWindow)"单窗口" else "多窗口"} · ${outcome.getDouble("process_ms").toLong()}毫秒")
    }catch(e:Throwable){setStatus(if(e is InterruptedException)"已停止" else "说话人切分失败：${e.message?:e.javaClass.simpleName}")}
    finally{diarizationRunning=false;active.set(false);startRequested=false;runOnUiThread{if(!destroyed)render()}}
@@ -809,7 +847,8 @@ class MainActivity:Activity(){
  }
  private fun loadDraft(draft:TranscriptReview.Edited){
   reviewRows=emptyList()
-  completedEdit=draft
+  val shownDraft=draft.copy(rows=displayRows(draft.rows))
+  completedEdit=shownDraft
   importedDraft=true
   editTarget=null
   recognitionSource="已导入勘误稿"
@@ -817,7 +856,7 @@ class MainActivity:Activity(){
   setStatus("共${draft.rows.size}条发言")
   showInstantPreview("")
   setResult("本次打开的是已有勘误稿，原始识别结果未载入。")
-  polishText=TranscriptReview.render(draft.rows)
+  polishText=TranscriptReview.render(shownDraft.rows)
   summaryText="点击“重新生成摘要”后，将使用这份勘误稿生成摘要。"
   if(page!=0){page=0;render()}else refreshPolishUi()
   if(!cloudReady(cloudSettings.summary()))offerCloudSettings()
@@ -848,8 +887,9 @@ class MainActivity:Activity(){
   TranscriptReview.render(TranscriptReview.transcriptRows(record,record.optString("file"),offset))
 
  // Worker callbacks share one pending UI update. Only new speaker lines are appended.
- private inner class FileProgress(private val file:String,private val offset:Long):TimeAlignedAsr.Progress {
+ private inner class FileProgress(private val file:String,private val offset:Long,previous:String):TimeAlignedAsr.Progress {
   private val ui=android.os.Handler(android.os.Looper.getMainLooper())
+  private val names=TranscriptPresentation.Names().apply{previous.lineSequence().forEach{line(it)}}
   private var scheduled=false
   private var nextUpdate=0L
   private var phase=""
@@ -869,8 +909,10 @@ class MainActivity:Activity(){
     val draft=transcript as? StringBuilder?:StringBuilder(transcript).also{transcript=it}
     if(draft.isNotEmpty())lines.insert(0,'\n')
     draft.append(lines)
-    if(page==0&&::resultView.isInitialized)resultView.append(lines.toString())
+    if(page==0&&::resultView.isInitialized)resultView.append(lines.lineSequence().joinToString("\n"){names.line(it)})
+    else lines.lineSequence().forEach{names.line(it)}
     lines.setLength(0)
+    refreshExpanded()
    }
   }
   @Synchronized override fun onVad(index:Int,text:String){
@@ -935,14 +977,15 @@ class MainActivity:Activity(){
     var firstFailure=""
     files.forEachIndexed { index,(label,file)->
      if(!startRequested)throw InterruptedException("已停止")
-     setStatus("正在识别${index+1}/${files.size}：$label")
+     val progressLabel="第${index+1}条录音，共${files.size}条"
+     setStatus("正在识别$progressLabel")
      val offset=nextStart
      val fileSegments=org.json.JSONArray()
      val completedLines=mutableListOf<String>()
      var sampleCount:Int?=null
      var stream:OnlineStream?=null
      var cancelled:InterruptedException?=null
-     val progress=if(useTurns&&!probe)FileProgress("${index+1}/${files.size}：$label",offset) else null
+     val progress=if(useTurns&&!probe)FileProgress(progressLabel,offset,output.toString()) else null
      val record=try{
       val samples=file.inputStream().use{WavReader.read16k(it)}
       sampleCount=samples.size
@@ -1039,9 +1082,10 @@ class MainActivity:Activity(){
     startRequested=false;active.set(false);setResult(output.toString());setStatus(message)
     val used=org.json.JSONArray()
     terms.forEach{(word,score)->used.put(org.json.JSONObject().put("word",word).put("score",score.toDouble()))}
+    val shownOutput=TranscriptPresentation.render(output.toString())
     val payload=org.json.JSONObject().put("status",message)
      .put("mode",if(useTurns)"speaker_turns" else if(useVad)"vad_segments" else "whole_file")
-     .put("transcript_text",output.toString())
+     .put("transcript_text",shownOutput)
      .put("transcript_scope",if(useTurns)"speaker_turns_only" else if(useVad)"vad_segments" else "whole_file")
      .put("merged_time_basis","顺序拼接可读取WAV的16kHz采样时长，单文件记录内为相对时间")
      .put("time_excluded_files",untimedFiles)
@@ -1051,7 +1095,7 @@ class MainActivity:Activity(){
      if(probe)File(getExternalFilesDir(null),"batch-result.json").writeText(payload.toString())
      else{
       val dir=File(getExternalFilesDir(null),"runs");dir.mkdirs();val runName="transcript-${System.currentTimeMillis()}"
-      File(dir,"$runName.json").writeText(payload.toString());File(dir,"$runName.txt").writeText(output.toString())
+      File(dir,"$runName.json").writeText(payload.toString());File(dir,"$runName.txt").writeText(shownOutput)
      }
     }catch(e:Exception){android.util.Log.e("HotwordTest","保存结果失败",e);setStatus("$message；结果保存失败：${e.message}")}
     runOnUiThread{recognitionBusy=false;if(!destroyed)render()}
@@ -1086,7 +1130,7 @@ class MainActivity:Activity(){
    finally{try{stream?.release()}catch(_:Exception){};try{engine?.release()}catch(_:Exception){}}
   }.start()
  }
- private fun start(){if(!idleForReview())return;val useVad=prefs.getBoolean("file_vad",true);val speakerEnabled=useVad&&prefs.getBoolean("speaker_enabled",true);val speakerKey=selectedSpeakerModel();val vadKey=selectedVadModel();val threshold=speakerThreshold();val decisionConfig=speakerDecisionConfig();val turnMode=useVad&&speakerEnabled&&prefs.getBoolean("live_speaker_turns",true);if(useVad && vadKey==VadModelFactory.FSMN){setStatus("FSMN仅支持60秒以内的离线文件，请切换Silero或TEN后录音");Toast.makeText(this,"FSMN不支持实时录音",Toast.LENGTH_LONG).show();return};beginRecognition("实时识别");startRequested=true;status="正在准备模型…";transcript="";render();val terms=words()
+ private fun start(){if(!idleForReview())return;val useVad=prefs.getBoolean("file_vad",true);val speakerEnabled=useVad&&prefs.getBoolean("speaker_enabled",true);val speakerKey=selectedSpeakerModel();val vadKey=selectedVadModel();val threshold=speakerThreshold();val decisionConfig=speakerDecisionConfig();val turnMode=useVad&&speakerEnabled&&prefs.getBoolean("live_speaker_turns",true);if(useVad && vadKey==VadModelFactory.FSMN){setStatus("FSMN仅支持60秒以内的离线文件，请切换Silero或TEN后录音");Toast.makeText(this,"FSMN不支持实时录音",Toast.LENGTH_LONG).show();return};beginRecognition("手机麦克风");startRequested=true;status="正在准备模型…";transcript="";render();val terms=words()
   Thread{var recorder:AudioRecord?=null;var engine:OnlineRecognizer?=null;var stream:OnlineStream?=null;var liveSpeaker:LiveSpeakerLabeler?=null;var liveSpeakerError:String?=null;var turnSplitter:LiveSpeakerTurnSegmenter?=null
    try{val dir=ensureModels();if(!startRequested)return@Thread;val h=if(terms.isNotEmpty())hotwordString(terms) else null
     setStatus(if(h==null)"正在加载模型（无热词）…" else "正在加载模型和${terms.size}个热词…")
@@ -1118,8 +1162,9 @@ class MainActivity:Activity(){
     fun saveLive(payload:org.json.JSONObject,body:String){
      val runs=File(getExternalFilesDir(null),"runs");runs.mkdirs()
      val name="live-${System.currentTimeMillis()}"
-     File(runs,"$name.json").writeText(payload.put("transcript_text",body).toString())
-     File(runs,"$name.txt").writeText(body)
+     val shown=TranscriptPresentation.render(body)
+     File(runs,"$name.json").writeText(payload.put("transcript_text",shown).toString())
+     File(runs,"$name.txt").writeText(shown)
     }
     reader.start();var previous=""
     if(useVad){

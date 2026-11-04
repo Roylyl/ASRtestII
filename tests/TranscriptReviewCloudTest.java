@@ -52,7 +52,7 @@ public final class TranscriptReviewCloudTest {
         check(b.getSpeech().equals("调试组件，再复核结果；预算3万元，不延期。"), "protected amount, negation and punctuation");
         check(a.getVoice()==FIRST.getVoice() && a.getPrefix().equals(FIRST.getPrefix()) && a.getSource().equals(FIRST.getSource()), "row identity");
         String summary=REVIEW.summarize(fixture,edited.getRows(),()->false,(label)->Unit.INSTANCE);
-        check(calls.get()==2 && summary.startsWith("【private-file.wav】\n两人讨论") && REVIEW.render(ROWS).contains("部暑"), "distinct outputs");
+        check(calls.get()==2 && summary.startsWith("两人讨论") && REVIEW.render(ROWS).contains("部暑"), "distinct outputs");
     }
 
     private static void rejectsIncompleteAndAmbiguousEdits() {
@@ -87,11 +87,49 @@ public final class TranscriptReviewCloudTest {
         check(previous.getRows().equals(ROWS) && retry.contains("讨论预算"),"Retry summary using completed correction");
     }
 
+    private static void wholeBatchAcrossSourcesAndActualContextFallback() {
+        List<Row> batch=Arrays.asList(FIRST,new Row("second.wav",SECOND.getPrefix(),SECOND.getSpeech()));
+        AtomicInteger calls=new AtomicInteger();
+        TranscriptReview.Completion full=(guide,input,cancelled)->{
+            int call=calls.incrementAndGet();
+            check(new JSONArray(input).length()==2,"all files must be in the same call");
+            check(!input.contains(".wav"),"source paths must not reach the model");
+            return call==1?"{\"complete\":true,\"edits\":[]}":"两人讨论了预算与部署工作。";
+        };
+        Edited edited=REVIEW.correct(full,batch,()->false,(i,n)->Unit.INSTANCE);
+        String summary=REVIEW.summarize(full,edited.getRows(),()->false,x->Unit.INSTANCE);
+        check(calls.get()==2&&summary.equals("两人讨论了预算与部署工作。"),"one correction and one overall summary");
+        AtomicInteger attempts=new AtomicInteger();
+        TranscriptReview.Completion context=(guide,input,cancelled)->{
+            attempts.incrementAndGet();JSONArray a=new JSONArray(input);
+            int targets=0;for(int k=0;k<a.length();k++)if(!a.getJSONObject(k).optBoolean("context_only",false))targets++;
+            if(targets>1)throw new org.hotwordtest.CloudContextLimitException();
+            return "{\"complete\":true,\"edits\":[]}";
+        };
+        REVIEW.correct(context,batch,()->false,(i,n)->Unit.INSTANCE);
+        check(attempts.get()==3,"split only after actual full-context rejection");
+        AtomicInteger extraction=new AtomicInteger(),merges=new AtomicInteger();
+        TranscriptReview.Completion longSummary=(guide,input,cancelled)->{
+            JSONArray a=new JSONArray(input);
+            if(a.optJSONObject(0)!=null)throw new org.hotwordtest.CloudContextLimitException();
+            merges.incrementAndGet();check(a.length()==2,"combine all notes");return "一份覆盖双方观点的总体摘要。";
+        };
+        TranscriptReview.Completion extract=(guide,input,cancelled)->{
+            extraction.incrementAndGet();return "保留对应发言人的观点、数字与经历。";
+        };
+        String combined=REVIEW.summarize(longSummary,batch,()->false,x->Unit.INSTANCE,extract);
+        check(extraction.get()==2&&merges.get()==1&&combined.equals("一份覆盖双方观点的总体摘要。"),"internal notes must yield one final summary");
+        AtomicInteger network=new AtomicInteger();
+        try {REVIEW.correct((g,i,c)->{network.incrementAndGet();throw new IllegalStateException("network");},batch,()->false,(i,n)->Unit.INSTANCE);throw new AssertionError();}
+        catch(IllegalStateException expected){check(network.get()==1,"network errors must not trigger splitting");}
+    }
+
     public static void main(String[] args) {
         twoRealStagesWithIsolatedPayloads();
         rejectsIncompleteAndAmbiguousEdits();
         cancellationAndSummaryRetry();
-        System.out.println("Passed 3 cloud transcript cases.");
+        wholeBatchAcrossSourcesAndActualContextFallback();
+        System.out.println("Passed 4 cloud transcript cases including cross-file batching and context fallback.");
     }
 }
 
