@@ -25,12 +25,13 @@ class VadFilePipeline(private val assets: AssetManager, private val vadKey:Strin
    .put("text",text).put("speaker_id",JSONObject.NULL).put("word_timestamps",JSONObject.NULL)
    .put("confidence",JSONObject.NULL).put("time_source","转换为16kHz单声道后的输入样本偏移，VAD边界及补白")
  }
- data class Outcome(val segments:List<Segment>,val inputSamples:Int,val vadKey:String=VadModelFactory.SILERO) {
+ data class Outcome(val segments:List<Segment>,val inputSamples:Int,val vadKey:String=VadModelFactory.SILERO,val transcriptsDecoded:Boolean=true) {
   fun json():JSONObject {val array=JSONArray();segments.forEach{array.put(it.json())};return JSONObject()
    .put("status","completed").put("sample_rate",SAMPLE_RATE).put("input_samples",inputSamples)
    .put("duration_ms",inputSamples*1000L/SAMPLE_RATE).put("segments",array)
    .put("speaker_status","not_implemented").put("word_timestamp_status","not_implemented")
-   .put("partial_scope","已完成VAD分段的ASR中间结果；非麦克风实时输出")
+   .put("partial_scope",if(transcriptsDecoded)"已完成VAD分段的ASR中间结果；非麦克风实时输出" else "仅记录VAD边界，未单独转写VAD整段")
+   .put("vad_transcript_status",if(transcriptsDecoded)"decoded" else "not_decoded")
    .put("vad_settings",settings(vadKey))}
   private fun settings(key:String):JSONObject {
    val config=JSONObject().put("model",VadModelFactory.asset(key)).put("pre_roll_samples",PRE_ROLL)
@@ -49,7 +50,15 @@ class VadFilePipeline(private val assets: AssetManager, private val vadKey:Strin
  fun process(samples:FloatArray, recognizer:OnlineRecognizer, hotwords:String,
              cancelled:()->Boolean={false},
              onPartial:(Int,Int,Int,String)->Unit={_,_,_,_->},
-             onFinal:(Segment)->Unit={}):Outcome {
+             onFinal:(Segment)->Unit={}):Outcome =
+  processInternal(samples,recognizer,hotwords,cancelled,onPartial,onFinal)
+
+ /** Speaker-turn transcription needs VAD timings, not a second copy of the ASR transcript. */
+ fun detect(samples:FloatArray,cancelled:()->Boolean={false},onFinal:(Segment)->Unit={}):Outcome =
+  processInternal(samples,null,"",cancelled,{_,_,_,_->},onFinal)
+
+ private fun processInternal(samples:FloatArray,recognizer:OnlineRecognizer?,hotwords:String,
+             cancelled:()->Boolean,onPartial:(Int,Int,Int,String)->Unit,onFinal:(Segment)->Unit):Outcome {
   val selected=VadModelFactory.normalize(vadKey)
   if(selected==VadModelFactory.FSMN)require(samples.size<=60*SAMPLE_RATE){"FSMN VAD单次输入不能超过60秒"}
   val results=mutableListOf<Segment>();var lastEnd=0
@@ -62,6 +71,10 @@ class VadFilePipeline(private val assets: AssetManager, private val vadKey:Strin
     val start=maxOf(lastEnd,rawStart-PRE_ROLL)
     val end=minOf(samples.size,rawEnd+POST_ROLL)
     if(end<=start)return
+    if(recognizer==null){
+     val segment=Segment(results.size,start,end,rawStart,rawEnd,"")
+     results.add(segment);lastEnd=end;onFinal(segment);return
+    }
     val stream=recognizer.createStream(hotwords)
     try{
      var p=start;var previous=""
@@ -83,7 +96,7 @@ class VadFilePipeline(private val assets: AssetManager, private val vadKey:Strin
     val end=(raw[i+1].toLong()*SAMPLE_RATE/1000).coerceIn(start.toLong(),samples.size.toLong()).toInt()
     consume(start,end)
    }
-   return Outcome(results.toList(),samples.size,vadKey)
+   return Outcome(results.toList(),samples.size,vadKey,recognizer!=null)
   }
   val window=VadModelFactory.windowSize(selected)
   val vad=VadModelFactory.create(assets,selected)
@@ -107,7 +120,7 @@ class VadFilePipeline(private val assets: AssetManager, private val vadKey:Strin
     }else detectedSince=-1
    }
    checkCancelled();vad.flush();drain()
-   return Outcome(results.toList(),samples.size,vadKey)
+   return Outcome(results.toList(),samples.size,vadKey,recognizer!=null)
   }finally{vad.release()}
  }
 }

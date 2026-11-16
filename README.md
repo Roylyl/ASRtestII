@@ -3,10 +3,10 @@
 </p>
 
 <h1 align="center">ASRtestII</h1>
-<p align="center">在Android手机上离线转写中英文录音，按时间和说话人阅读对话，并按需生成勘误稿与内容摘要。</p>
+<p align="center">在Android手机上离线转写中英文录音，管理和持续补充声纹，按时间与说话人阅读对话。</p>
 
 <p align="center">
-  <a href="https://github.com/Roylyl/ASRtestII/releases/latest"><img src="https://img.shields.io/github/v/release/Roylyl/ASRtestII?style=flat-square&amp;display_name=tag&amp;label=Release&amp;color=2563eb" alt="最新发行版本"></a>
+  <a href="./app/AndroidManifest.xml"><img src="https://img.shields.io/badge/version-2.0.0-2563eb?style=flat-square" alt="源码版本2.0.0"></a>
   <a href="#安装与快速开始"><img src="https://img.shields.io/badge/Android-8.0%2B-27754d?style=flat-square&amp;logo=android&amp;logoColor=white" alt="Android 8.0及以上"></a>
   <a href="#安装与快速开始"><img src="https://img.shields.io/badge/ABI-arm64--v8a-526479?style=flat-square" alt="arm64-v8a架构"></a>
   <a href="#许可证与第三方声明"><img src="https://img.shields.io/badge/Code%20license-Apache--2.0-485d75?style=flat-square" alt="项目原创代码采用Apache-2.0"></a>
@@ -15,24 +15,26 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Roylyl/ASRtestII/releases/latest">下载最新版</a> ·
+  <a href="https://github.com/Roylyl/ASRtestII/releases">发行下载</a> ·
   <a href="#安装与快速开始">快速开始</a> ·
   <a href="#主要功能">主要功能</a> ·
+  <a href="#声纹持续学习">持续学习</a> ·
   <a href="./使用说明.md">详细说明</a> ·
   <a href="#从源码构建">源码构建</a> ·
   <a href="https://github.com/Roylyl/ASRtestII/issues">反馈问题</a>
 </p>
 
-ASRtestII把X-ASR、VAD和说话人处理集成到一个Android应用中，适合整理访谈、播客、会议、课程和日常对话。录音和文件转写直接在手机上执行；完成转写后，可连接自己配置的云端语言模型，结合上下文校对文字，再生成一份分点摘要。
+ASRtestII把X-ASR、VAD和说话人处理集成到一个Android应用中，适合整理访谈、播客、会议、课程和日常对话。录音、文件转写和声纹学习直接在手机上执行；同一个人可以积累不同语气、音量和距离下的补充模板。完成转写后，也可连接自己配置的云端语言模型，校对文字并生成分点摘要。
 
 ## 安装与快速开始
 
 需要Android8.0及以上、arm64-v8a架构的设备，并为APK及首次准备模型预留存储空间。安装包内置语音识别、VAD和说话人模型，首次转写即可在离线状态下使用。
 
-1. 从[GitHub发行页](https://github.com/Roylyl/ASRtestII/releases/latest)下载安装包。版本标签与附件对应，例如`V1.1.0`对应`ASRtestII-1.1.0.apk`。
+1. 从[GitHub发行页](https://github.com/Roylyl/ASRtestII/releases)选择已发布的安装包，或按[源码构建](#从源码构建)生成当前版本APK。下载时以发行页的标签和附件版本为准。
 2. 打开底部“测试”页，点击“开始手机录音”，允许麦克风权限。看到正在录音的提示后开始讲话，点击“结束手机录音”提交尾句。
 3. 使用已有录音时，点击“导入WAV/ZIP”，通过系统文件选择器选取单个WAV，或包含多条WAV的ZIP。
 4. 等待处理完成。点击结果标题右侧的“展开”，可以滚动阅读、选择文字或复制全文。
+5. 需要识别固定人物时，先在“声纹→声纹管理”登记，再到“学习”页查看自动学习开关、待确认片段与补充样本。
 
 默认开启VAD分段、本地声纹区分和连续说话人细分。启用这些功能后，结果按发言时间排列。
 
@@ -52,12 +54,13 @@ ASRtestII把X-ASR、VAD和说话人处理集成到一个Android应用中，适�
 |VAD语音分段|提供Silero、TEN和实验性FSMN选项，检测人声区间并管理停顿。|
 |说话人细分|结合pyannote活动切分与CAM++或ERes2NetV2声纹特征，按时间和人物输出发言。|
 |个人声纹管理|录制并命名声纹，保存两种模型的特征，支持重命名、补录和删除。|
+|本地持续学习|高可信语音自动追加到已登记人物；不确定片段保留待确认，可更正归属、逐条删除补充模板或撤销学习。|
 |领域与自定义热词|按场景选择词包，也可输入中英文术语，分别调节四档权重。|
 |转写勘误与总体摘要|使用配置的云端模型校对转写，再按话题整理关键问答、观点和经历。|
 |长文本阅读|识别结果、勘误稿和摘要均可展开阅读，并复制全部文字。|
 |运行状态与更新|显示应用和整机RAM占用，支持检查正式发行版、下载更新并调用系统安装器。|
 
-底部四个栏目分别为“测试”“热词”“声纹”“设置”。“测试”用于录音、导入和阅读结果；“声纹”集中管理登记记录与归组阈值；模型选择、VAD开关和云端接口位于“设置”。
+底部五个栏目依次为“测试”“热词”“学习”“声纹”“设置”。“测试”用于录音、导入和阅读结果；“学习”用于候选确认、更正及补充样本管理；“声纹”集中管理登记记录与归组阈值；模型选择、VAD开关和云端接口位于“设置”。
 
 ## 本地处理与模型
 
@@ -129,6 +132,20 @@ ZIP中的WAV按文件名排序，每条录音独立处理并刷新尾部。界�
 
 姓名匹配属于模型预测。短回答、噪声、声音过轻和多人重叠会影响归属，部分发言会保留未识别或重叠标记；时间区间来自音频处理边界，不能当作逐词时间戳。
 
+## 声纹持续学习
+
+持续学习复用现有声纹模型，为已登记人物追加模板，不重新训练模型。同一个人沿用固定用户ID，重命名不会新建人物；初始登记模板保留并持续参与匹配。
+
+1. 在“声纹→声纹管理”登记人物，或打开已有人物选择“补录同一个人的声音”，补充不同的自然语气、音量与距离。
+2. 正常录音或导入文件。应用从连续纯净语音中收集候选，检查时长、质量、局部声纹一致性及人物归属，排除过短、重叠和明显冲突的片段。
+3. “学习”页的“自动学习”首次安装默认打开。符合严格条件的已登记人物片段会自动追加；可保存但证据不足的片段进入“待确认学习片段”。关闭开关后停止自动追加，仍可手动管理候选。
+4. 需要更正时，在“更正说话人与学习”选择发言并指定已登记人物。确认归属仍须通过声学质量检查；只更正显示不等于已经加入声纹库。
+5. 新模板从下一次识别生效，进行中的任务保持开始时的声纹库快照。在“管理学习样本”中选择人物，可删除单条补充模板或撤销最近一次学习，初始模板保留。
+
+每人最多保存24条补充模板。待确认片段尚不参与匹配；候选试听与实际学习使用同一段纯净音频，确认或丢弃后移除候选音频。补充模板保存声纹特征及来源信息，不长期保留试听录音。
+
+模板增加不等于每次都提高准确率。“学习→学习前后本地对照”可添加另外录制的本人和他人语音，比较初始模板与包含补充模板的识别结果，帮助决定是否保留某次补充。
+
 ## 云端勘误与总体摘要
 
 本地转写完成后，可点击“开始勘误并总结”。首次使用需要在“设置→云端模型”填写三个项目。
@@ -154,6 +171,7 @@ ZIP中的WAV按文件名排序，每条录音独立处理并刷新尾部。界�
 |---|---|
 |音频、VAD、语音转写与声纹比较|在手机本地处理。|
 |声纹登记|特征保存在应用私有目录，登记录音只在内存中处理。|
+|学习候选与补充模板|待确认音频和特征保存在应用私有目录，供试听与确认；确认或丢弃后移除候选音频，已学模板保留特征和来源信息。|
 |云端勘误与摘要|点击开始后，将转写文字和说话人标签发送到配置的服务，音频与声纹特征保留在本机。|
 |API Key|由Android Keystore保护的密钥加密，保存在本机。|
 |应用更新|联网读取GitHub正式发行信息，并按用户选择下载APK。|
@@ -212,20 +230,20 @@ WAV是容器格式，内部也可能存放浮点PCM或压缩音频。请将文�
 
 ## 从源码构建
 
-构建环境为Windows、PowerShell7、JDK17、Android SDK和Git LFS。SDK需要包含Android平台与Build Tools；可配置`JAVA_HOME`和`ANDROID_HOME`，也可向构建脚本传入路径。
+构建环境为Windows、PowerShell7、JDK17或21、Android SDK和Git LFS。SDK需要包含Android平台与Build Tools；可配置`JAVA_HOME`和`ANDROID_HOME`，也可向构建脚本传入路径。随附Kotlin2.1编译器不兼容JDK25，请选择JDK17或21。
 
 ```powershell
 git lfs install
 git clone https://github.com/Roylyl/ASRtestII.git
 cd ASRtestII
 git lfs pull
-pwsh -File .\Build-Apk.ps1 -Unsigned
+pwsh -File .\Build-Apk.ps1 -JdkHome "C:\path\to\jdk-21" -Unsigned
 ```
 
-当前版本的未签名安装包默认输出到Windows桌面，文件名为`ASRtestII-1.1.0-unsigned.apk`。使用已有Android签名密钥构建可安装的APK时，指定密钥库和别名，按提示输入密码。
+当前源码的`versionName`为`2.0.0`，`versionCode`为`2000000`。将示例中的JDK路径改成实际安装目录；未签名安装包默认输出到Windows桌面，文件名为`ASRtestII-2.0.0-unsigned.apk`，签名后才能安装。使用自己的Android签名密钥直接构建可安装APK时，指定密钥库和别名，按提示输入密码。
 
 ```powershell
-pwsh -File .\Build-Apk.ps1 -Keystore "D:\keys\release.p12" -KeyAlias "release"
+pwsh -File .\Build-Apk.ps1 -JdkHome "C:\path\to\jdk-21" -Keystore "D:\keys\release.p12" -KeyAlias "release"
 ```
 
 默认签名包名为`ASRtestII-版本号.apk`，可用`-OutputApk`指定输出路径。覆盖安装已有版本需要沿用相同证书。
@@ -248,8 +266,8 @@ pwsh -File .\Build-Apk.ps1 -Keystore "D:\keys\release.p12" -KeyAlias "release"
 <summary>维护者发布新版本</summary>
 
 1. 更新[AndroidManifest.xml](./app/AndroidManifest.xml)中的`versionName`，同时递增`versionCode`。
-2. 用原发行证书构建签名APK，使附件名与版本一致。例如`versionName=1.1.1`时，附件名为`ASRtestII-1.1.1.apk`。
-3. 在GitHub创建标签为`V1.1.1`的正式Release，上传APK并填写更新说明。应用按三段版本号比较更新，跳过草稿和预发布版。
+2. 用原发行证书构建签名APK，使附件名与版本一致。例如`versionName=2.0.1`时，附件名为`ASRtestII-2.0.1.apk`。
+3. 在GitHub创建对应版本标签的正式Release，上传APK并填写更新说明。应用按三段版本号比较更新，跳过草稿和预发布版。
 
 </details>
 

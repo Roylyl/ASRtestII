@@ -3,6 +3,10 @@ build/
 /apk/
 /release/
 /dist/
+/验收记录/
+/回退版本/
+/测试结论.md
+/明日续测.md
 .gradle/
 .kotlin/
 .cxx/
@@ -57,9 +61,19 @@ adbkey.pub
 /exports/
 /captures/
 /voiceprints/
+/datasets/
+/samples/
 /results/
 /logs/
 runs/
+voice-learning/
+voice-profiles/
+voice-learning-evaluation/
+voice-learning-evaluation.json
+voice-confirm-*/
+wearer-voice-*.json
+*.npy
+*.npz
 *.wav
 *.flac
 *.mp3
@@ -89,6 +103,8 @@ codex-clipboard-*.png
 !/tests/cloud-probe/AndroidManifest.xml
 /tests/*-classes/
 /tests/local-summary-probe/
+# Device-specific experiment harnesses and their private fixtures stay local.
+/tests/voice-learning-probe/
 # Historical one-machine replay scripts contain local device and recording references
 /tests/build_vad_report.py
 /tests/english_probe.py

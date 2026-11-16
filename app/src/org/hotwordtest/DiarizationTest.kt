@@ -21,11 +21,11 @@ object DiarizationTest {
  private const val SEGMENTATION="models/pyannote-segmentation.onnx"
  private const val THREADS=2
  private const val CLUSTER_THRESHOLD=0.5f
- private fun config(key:String, numClusters:Int, debug:Boolean=false,similarityThreshold:Double=SpeakerDefaults.NATIVE_SIMILARITY_PERCENT/100.0)=OfflineSpeakerDiarizationConfig(
+ private fun config(key:String, numClusters:Int, debug:Boolean=false,similarityThreshold:Double=SpeakerDefaults.NATIVE_SIMILARITY_PERCENT/100.0,rawActivity:Boolean=false)=OfflineSpeakerDiarizationConfig(
   segmentation=OfflineSpeakerSegmentationModelConfig(pyannote=OfflineSpeakerSegmentationPyannoteModelConfig(model=SEGMENTATION,windowShiftRatio=0.1f),numThreads=THREADS,debug=debug,provider="cpu"),
   embedding=SpeakerEmbeddingExtractorConfig(model=SpeakerModels.asset(key),numThreads=THREADS,provider="cpu"),
   clustering=FastClusteringConfig(numClusters=numClusters,threshold=(1.0-similarityThreshold).toFloat()),
-  minDurationOn=0.2f,minDurationOff=0.5f)
+  minDurationOn=if(rawActivity)0f else 0.2f,minDurationOff=if(rawActivity)0f else 0.5f)
  private data class SegmentOutput(val segments:JSONArray,val boundaryAdjustments:JSONArray)
  // JNI looks up invoke(int,int,long):Integer. An indy lambda only exposes the erased bridge.
  private class NativeProgress(private val update:(Int,Int)->Unit):(Int,Int,Long)->Int {
@@ -49,10 +49,10 @@ object DiarizationTest {
   }
   return SegmentOutput(output,adjustments)
  }
- class Session(assets:AssetManager,key:String,private val numClusters:Int,private val similarityThreshold:Double=SpeakerDefaults.NATIVE_SIMILARITY_PERCENT/100.0):AutoCloseable {
+ class Session(assets:AssetManager,key:String,private val numClusters:Int,private val similarityThreshold:Double=SpeakerDefaults.NATIVE_SIMILARITY_PERCENT/100.0,private val rawActivity:Boolean=false):AutoCloseable {
   private val k=SpeakerModels.normalize(key)
   private val initStarted=SystemClock.elapsedRealtimeNanos()
-  private val diarizer=OfflineSpeakerDiarization(assets,config(k,numClusters,similarityThreshold=similarityThreshold))
+  private val diarizer=OfflineSpeakerDiarization(assets,config(k,numClusters,similarityThreshold=similarityThreshold,rawActivity=rawActivity))
   val initMs=(SystemClock.elapsedRealtimeNanos()-initStarted)/1000000.0
   fun process(samples:FloatArray,onProgress:((Int,Int)->Unit)?=null):JSONObject {
    require(diarizer.sampleRate()==16000){"说话人模型采样率不是16kHz"}
@@ -61,6 +61,9 @@ object DiarizationTest {
    return JSONObject().put("status","completed").put("speaker_model",SpeakerModels.name(k)).put("segmentation_model",SEGMENTATION)
     .put("processing_mode",if(singleWindow)"single_window_segmentation_only" else "multi_window_diarization_candidate")
     .put("speaker_embedding_execution",if(singleWindow)"not_executed" else "not_verified_for_this_input")
+    .put("activity_postprocessing",if(rawActivity)"unsmoothed_hard_activity" else "display_smoothed_activity")
+    .put("min_duration_on",if(rawActivity)0.0 else 0.2).put("min_duration_off",if(rawActivity)0.0 else 0.5)
+    .put("frame_probabilities_available",false)
     .put("processing_mode_basis","pyannote模型窗口160000采样；多窗口可能因无语音等原因提前返回")
     .put("sample_rate",16000).put("audio_seconds",samples.size/16000.0).put("num_threads",THREADS)
     .put("clustering",JSONObject().put("mode",if(numClusters==2)"fixed_two_speakers_prior" else "automatic").put("num_clusters",numClusters).put("threshold",1.0-similarityThreshold).put("similarity_threshold",similarityThreshold).put("threshold_meaning","cosine_distance_1_minus_similarity").put("threshold_status","uncalibrated"))
@@ -70,6 +73,16 @@ object DiarizationTest {
  }
  fun processOne(assets:AssetManager,samples:FloatArray,key:String,numClusters:Int):JSONObject {
   return Session(assets,key,numClusters).use { it.process(samples) }
+ }
+ /** Learning uses window-local activity, before gap filling. No local track is a named person. */
+ class ActivitySession(assets:AssetManager,includeLegacy:Boolean=false):AutoCloseable {
+  private val raw=Session(assets,SpeakerModels.CAM,-1,rawActivity=true)
+  private val legacy=if(includeLegacy)Session(assets,SpeakerModels.CAM,-1) else null
+  fun process(samples:FloatArray):JSONObject {
+   require(samples.isNotEmpty()&&samples.size<=160000){"原始活动检查窗口必须为10秒以内"}
+   return JSONObject().put("unsmoothed",raw.process(samples)).also{out->legacy?.let{out.put("legacy",it.process(samples))}}
+  }
+  override fun close(){try{raw.close()}finally{legacy?.close()}}
  }
  fun runProbe(activity:Activity) {
   Thread {

@@ -45,12 +45,25 @@ class MainActivity:Activity(){
  @Volatile private var recognitionBusy=false
  @Volatile private var reviewRows:List<TranscriptReview.Row> = emptyList()
  private var polishWorker:Thread?=null
+ private var learningRun:VoiceLearningRun?=null
+ private var learningLiveSource=""
+ private var learningAction:TextView?=null
+ private var learningCandidatesAction:TextView?=null
+ private var learningManageAction:TextView?=null
+ private var learningEvaluationAction:TextView?=null
+
 
  private var recognitionSource="手机麦克风或导入文件"
  private var reviewNote=""
  private fun sourceStatus(value:String)=(if(recognitionSource.isEmpty())value else "来源：$recognitionSource · $value")+
   if(reviewNote.isEmpty())"" else " · $reviewNote"
  private fun beginRecognition(source:String){
+  learningRun?.cancel()
+  val learningPrefs=prefs
+  learningRun=VoiceLearningRun(applicationContext,
+   enabledAtStart=learningPrefs.getBoolean("auto_voice_learning",true),
+   isEnabledNow={learningPrefs.getBoolean("auto_voice_learning",true)})
+  learningLiveSource="live:"+java.util.UUID.randomUUID()
   recognitionSource=source
   reviewNote=""
   recognitionBusy=true
@@ -61,8 +74,8 @@ class MainActivity:Activity(){
   polishText="等待本次转写完成"
   summaryText="勘误完成后在此显示摘要。"
  }
- private fun idleForReview() = !recognitionBusy && !active.get() && !startRequested &&
-  !diarizationRunning && !polishRunning && !readingDraft && !destroyed
+ private fun idleForReview():Boolean = !recognitionBusy && !active.get() && !startRequested &&
+  !diarizationRunning && !polishRunning && !readingDraft && !VoiceLearningCorrectionsUi.isBusy && !learningEvaluation.isBusy && !destroyed
  private fun hasReviewMaterial() = reviewRows.isNotEmpty() || importedDraft
  private fun reusableEdit(target:Pair<String,String>)=completedEdit?.takeIf{importedDraft || editTarget==target}
 
@@ -75,7 +88,7 @@ class MainActivity:Activity(){
    .setNegativeButton("稍后"){dialog,_->dialogTap(dialog)}
    .setPositiveButton("去设置"){dialog,_->
     dialogTap(dialog)
-    page=3
+    page=4
     render()
     openCloudModelSettings()
    }.show()
@@ -174,7 +187,8 @@ class MainActivity:Activity(){
    }finally{updatePolishUi{polishRunning=false;polishPhase=0;polishWorker=null}}
   }.apply{start()}
  }
- private val voiceEnrollment by lazy { VoiceEnrollmentDialog(this,{selectedSpeakerModel()},{idleForReview()},{if(!destroyed&&(page==2||page==3))render()}) }
+ private val learningEvaluation:VoiceLearningEvaluationUi by lazy { VoiceLearningEvaluationUi(this,{selectedSpeakerModel()},{idleForReview()},{if(!destroyed)render()}) }
+ private val voiceEnrollment by lazy { VoiceEnrollmentDialog(this,{selectedSpeakerModel()},{idleForReview()},{if(!destroyed)render()}) }
  private lateinit var content:LinearLayout; private lateinit var statusView:TextView; private lateinit var resultView:TextView
  private lateinit var ramView:TextView
  private var ramText="RAM占用：— MB\n本机：— / — MB"
@@ -208,10 +222,10 @@ class MainActivity:Activity(){
  private fun speakerMinMargin():Double=prefs.getInt("speaker_min_margin",SpeakerDefaults.MARGIN_PERCENT).coerceIn(0,100)/100.0
  private fun speakerDecisionConfig():SpeakerDecisionConfig=SpeakerDecisionConfig(
   strongMatch=speakerMatchThreshold(),weakMatch=SpeakerDefaults.WEAK_MATCH_PERCENT/100.0,
-  newSpeakerMax=speakerNewMaxSimilarity(),ambiguityMargin=speakerMinMargin())
+  newSpeakerMax=speakerNewMaxSimilarity(),ambiguityMargin=speakerMinMargin(),clusterThreshold=speakerThreshold())
  private fun speakerDecisionJson(config:SpeakerDecisionConfig):org.json.JSONObject=org.json.JSONObject()
   .put("strong_match",config.strongMatch).put("weak_match",config.weakMatch)
-  .put("new_speaker_max_similarity",config.newSpeakerMax).put("ambiguity_margin",config.ambiguityMargin)
+  .put("new_speaker_max_similarity",config.newSpeakerMax).put("ambiguity_margin",config.ambiguityMargin).put("anonymous_cluster_threshold",config.clusterThreshold)
   .put("status","experimental_uncalibrated")
  // Initialize missing defaults only; never overwrite values from older installations.
  private fun initializeSpeakerPipelineDefaults(){
@@ -302,7 +316,7 @@ class MainActivity:Activity(){
    importantForAccessibility=View.IMPORTANT_FOR_ACCESSIBILITY_NO
   }
  }
- override fun onCreate(b:Bundle?){super.onCreate(b);clearRetiredModelCache();initializeSpeakerPipelineDefaults();try{FsmnVad.configure(this)}catch(e:Throwable){android.util.Log.e("HotwordTest","FSMN VAD初始化失败",e);status="FSMN VAD初始化失败：${e.message?:e.javaClass.simpleName}"};window.statusBarColor=bg;window.navigationBarColor=Color.WHITE;window.decorView.systemUiVisibility=View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;render();if(intent.getBooleanExtra("probe",false)) runProbe();if(intent.getBooleanExtra("batchProbe",false)) startBatch(Uri.fromFile(File(getExternalFilesDir(null),"batch-probe.zip")),"batch-probe.zip",true);if(intent.getBooleanExtra("liveReplayProbe",false))runLiveReplayProbe();if(intent.getBooleanExtra("speakerProbe",false))runSpeakerProbe(this);if(intent.getBooleanExtra("diarizationProbe",false))DiarizationTest.runProbe(this);if(intent.getBooleanExtra("vadComparisonProbe",false))VadComparisonProbe.run(this);if(intent.getBooleanExtra("alignmentProbe",false))TimeAlignedAsr.runProbe(this){ensureModels()};if(intent.getBooleanExtra("hourComparisonProbe",false))HourComparisonProbe.start(this,intent.getStringExtra("hourRunId")?:"",intent.getStringExtra("hourVad")?:"",intent.getStringExtra("hourSpeaker")?:"",{ensureModels()},{setStatus(it)});if(intent.getBooleanExtra("optimizedSpeakerProbe",false))OptimizedSpeakerProbe.start(this){setStatus(it)};if(intent.getBooleanExtra("liveSpeakerProbe",false))LiveSpeakerProbe.run(this){ensureModels()};if(intent.getBooleanExtra("longProbe",false))LongAudioProbe.start(this,intent.getStringExtra("longRunId")?:"",{ensureModels()},{setStatus(it)})}
+ override fun onCreate(b:Bundle?){super.onCreate(b);try{VoiceLearningEvaluation.recoverPendingProfileDeletes(applicationContext)}catch(e:Exception){android.util.Log.e("HotwordTest","recover pending voice deletion failed",e);status="上次声纹删除未完成，请稍后重启应用重试"};try{val cleanup=VoiceLearningStore.cleanupOrphanIdentitySnapshots(applicationContext);if(cleanup.failed>0){val warning="声纹临时数据清理未完成，请重启重试";status=if(status=="准备就绪")warning else "$status；$warning"}}catch(e:Exception){android.util.Log.e("HotwordTest","clean orphan voice snapshots failed",e);val warning="声纹临时数据清理未完成，请重启重试";status=if(status=="准备就绪")warning else "$status；$warning"};clearRetiredModelCache();initializeSpeakerPipelineDefaults();try{FsmnVad.configure(this)}catch(e:Throwable){android.util.Log.e("HotwordTest","FSMN VAD初始化失败",e);val warning="FSMN VAD初始化失败：${e.message?:e.javaClass.simpleName}";status=if(status=="准备就绪")warning else "$status；$warning"};window.statusBarColor=bg;window.navigationBarColor=Color.WHITE;window.decorView.systemUiVisibility=View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;render();if((applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE)!=0){if(intent.getBooleanExtra("probe",false)) runProbe();if(intent.getBooleanExtra("batchProbe",false)) startBatch(Uri.fromFile(File(getExternalFilesDir(null),"batch-probe.zip")),"batch-probe.zip",true);if(intent.getBooleanExtra("liveReplayProbe",false))runLiveReplayProbe();if(intent.getBooleanExtra("speakerProbe",false))runSpeakerProbe(this);if(intent.getBooleanExtra("diarizationProbe",false))DiarizationTest.runProbe(this);if(intent.getBooleanExtra("vadComparisonProbe",false))VadComparisonProbe.run(this);if(intent.getBooleanExtra("alignmentProbe",false))TimeAlignedAsr.runProbe(this){ensureModels()};if(intent.getBooleanExtra("hourComparisonProbe",false))HourComparisonProbe.start(this,intent.getStringExtra("hourRunId")?:"",intent.getStringExtra("hourVad")?:"",intent.getStringExtra("hourSpeaker")?:"",{ensureModels()},{setStatus(it)});if(intent.getBooleanExtra("optimizedSpeakerProbe",false))OptimizedSpeakerProbe.start(this){setStatus(it)};if(intent.getBooleanExtra("liveSpeakerProbe",false))LiveSpeakerProbe.run(this){ensureModels()};if(intent.getBooleanExtra("longProbe",false))LongAudioProbe.start(this,intent.getStringExtra("longRunId")?:"",{ensureModels()},{setStatus(it)})}}
  private fun render(){
   val root=LinearLayout(this).apply {orientation=LinearLayout.VERTICAL;setBackgroundColor(bg)}
   val header=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL;setPadding(dp(20),dp(14),dp(20),dp(8))}
@@ -312,10 +326,10 @@ class MainActivity:Activity(){
   titleRow.addView(ramView);header.addView(titleRow)
   header.addView(text("X-ASR1920ms · 本地离线识别",12,blue));root.addView(header)
   val scroller=ScrollView(this);content=LinearLayout(this).apply{orientation=LinearLayout.VERTICAL;setPadding(dp(16),dp(8),dp(16),dp(8))};scroller.addView(content);root.addView(scroller,LinearLayout.LayoutParams(-1,0,1f))
-  when(page){0->showTest();1->showWords();2->showVoiceSettings();else->showSettings()}
+  when(page){0->showTest();1->showWords();2->showLearning();3->showVoiceSettings();else->showSettings()}
   val divider=View(this).apply{setBackgroundColor(Color.rgb(221,221,225))};root.addView(divider,LinearLayout.LayoutParams(-1,dp(1)))
   val nav=LinearLayout(this).apply{orientation=LinearLayout.HORIZONTAL;setPadding(dp(12),dp(3),dp(12),dp(3));setBackgroundColor(Color.WHITE)}
-  val tabs=listOf("测试" to "nav_mic","热词" to "nav_tag","声纹" to "nav_voice","设置" to "nav_settings")
+  val tabs=listOf("测试" to "nav_mic","热词" to "nav_tag","学习" to "nav_learning","声纹" to "nav_voice","设置" to "nav_settings")
   tabs.forEachIndexed { i,(name,drawable)->
    val selected=page==i
    val item=LinearLayout(this).apply{
@@ -467,6 +481,28 @@ class MainActivity:Activity(){
   listOf(recordAction,importAction,polishAction,draftAction).forEach{it.alpha=if(it.isEnabled)1f else 0.45f}
   refreshExpanded()
  }
+ private fun showLearningCorrections(){
+  val originalRows=reviewRows
+  val originalRun=learningRun
+  VoiceLearningCorrectionsUi.show(this,originalRows,originalRun,::idleForReview,corrected={index,person->
+   if(originalRows!==reviewRows || originalRun!==learningRun || destroyed)return@show
+   val row=reviewRows.getOrNull(index)?:return@show
+   val prefix=row.prefix.substringBefore(']')+"]"+person.name+"："
+   reviewRows=reviewRows.toMutableList().apply{set(index,row.copy(prefix=prefix,voice=null))}
+   setResult(TranscriptReview.render(displayRows(reviewRows)))
+   completedEdit=null;importedDraft=false;editTarget=null
+   polishText="人物已更正，可重新勘误。";summaryText="等待本次勘误后生成摘要。"
+   reviewNote="已按用户确认更正人物"
+   val savedRows=reviewRows.toList()
+   Thread{
+    try{
+     val folder=File(getExternalFilesDir(null),"runs").also{it.mkdirs()}
+     File(folder,"speaker-corrected-"+System.currentTimeMillis()+".txt").writeText(TranscriptReview.render(displayRows(savedRows)))
+    }catch(e:Exception){android.util.Log.e("HotwordTest","保存更正稿失败",e)}
+   }.start()
+   if(page==2&&!destroyed)render() else refreshPolishUi()
+  })
+ }
  private fun decodeSpeakerTurn(engine:OnlineRecognizer,hotwords:String?,samples:FloatArray):String {
   val stream=engine.createStream(hotwords?:"")
   try{var p=0;while(p<samples.size){val end=minOf(p+800,samples.size);stream.acceptWaveform(samples.copyOfRange(p,end),16000);p=end;while(engine.isReady(stream))engine.decode(stream)}
@@ -475,46 +511,17 @@ class MainActivity:Activity(){
   }finally{stream.release()}
  }
  private fun describeSpeakerTurns(seg:VadLiveSegmenter.Segment,out:LiveSpeakerTurnSegmenter.Outcome,original:String,
-                                  engine:OnlineRecognizer,hotwords:String?,speaker:LiveSpeakerLabeler?):org.json.JSONArray {
-  val items=mutableListOf<Pair<LiveSpeakerTurnSegmenter.Turn,String>>()
+                                  engine:OnlineRecognizer,hotwords:String?):org.json.JSONArray {
+  val rows=org.json.JSONArray()
   for(turn in out.turns){
    val text=if(out.turns.size==1)original else if(turn.audio.size<1600)"" else decodeSpeakerTurn(engine,hotwords,turn.audio)
-   items.add(turn to text)
-  }
-  val local=linkedMapOf<Int,String>();val globalByLocal=mutableMapOf<Int,String>();val conflicted=mutableSetOf<Pair<Int,Int>>()
-  for(id in out.turns.flatMap{it.localIds}.distinct().sorted()){
-   val clean=items.filter{it.first.localIds==listOf(id)&&it.second.isNotBlank()}.map{it.first.audio}
-   val size=clean.sumOf{it.size};var label="说话人未识别"
-   if(size>=16000&&speaker!=null){
-    val audio=FloatArray(size);var pos=0;for(part in clean){part.copyInto(audio,pos);pos+=part.size}
-    val prior=speaker.snapshotAnonymousGroups()
-    val voice=try{speaker.classify(audio,true)}catch(_:Exception){speaker.restoreAnonymousGroups(prior);null}
-    val sp=voice?.optJSONObject("speaker")
-    if(voice?.optJSONObject("identity")?.optString("status")=="wearer_candidate")label=voice.optString("display").ifBlank{label}
-    if(sp!=null&&!sp.isNull("speaker_id")){
-     val group=sp.getString("speaker_id")
-     val collision=globalByLocal.filter{(other,g)->g==group&&out.turns.any{it.localIds.contains(id)&&it.localIds.contains(other)}}.keys
-     if(collision.isNotEmpty()){
-      speaker.restoreAnonymousGroups(prior)
-      collision.forEach{other->conflicted.add(minOf(id,other) to maxOf(id,other))}
-     }else{
-      globalByLocal[id]=group;label=voice.optString("display").ifBlank{SpeakerTranscript.groupName(group)}
-     }
-    }
-   }
-   local[id]=label
-  }
-  val rows=org.json.JSONArray()
-  for((turn,text) in items){
-   val names=turn.localIds.map{local[it]?:"说话人未识别"}
-   val collision=turn.localIds.indices.any{i->turn.localIds.indices.any{j->i<j&&conflicted.contains(minOf(turn.localIds[i],turn.localIds[j]) to maxOf(turn.localIds[i],turn.localIds[j]))}}
-   val display=when(names.size){0->"说话人未识别";1->names[0];else->if(collision||names.distinct().size<names.size)"多人重叠，归属未区分" else "重叠："+names.joinToString("、"){if(it=="说话人未识别")"另有未归组声音" else it}}
    val ids=org.json.JSONArray();turn.localIds.forEach{ids.put(it)}
    rows.put(org.json.JSONObject().put("start_sample",turn.start).put("end_sample",turn.end)
     .put("start_ms",turn.start*1000/16000).put("end_ms",turn.end*1000/16000)
-    .put("local_speaker_ids",ids).put("speaker_display",display).put("localized_speaker_display",true).put("text",text)
-    .put("overlap_status",if(names.size>1)"predicted_overlap" else "not_confirmed")
-    .put("identity_status",if(names.size>1)"ambiguous_overlap" else "unverified"))
+    .put("local_speaker_ids",ids).put("speaker_display",if(turn.localIds.size>1)"多人重叠" else "说话人未识别")
+    .put("localized_speaker_display",true).put("text",text)
+    .put("overlap_status",if(turn.localIds.size>1)"predicted_overlap" else "evidence_checked")
+    .put("identity_status","awaiting_stable_evidence"))
   }
   return rows
  }
@@ -534,6 +541,38 @@ class MainActivity:Activity(){
    val labels=listOf("默认","轻度","中度","高");val strength=text("权重：${labels[prefs.getInt("weight_"+name,0).coerceIn(0,3)]}",13,Color.DKGRAY).apply{setPadding(0,dp(12),0,0)};c.addView(strength)
    val slider=WeightSlider().apply{progress=prefs.getInt("weight_"+name,0).coerceIn(0,3);contentDescription="$name 热词权重";setOnSeekBarChangeListener(object:SeekBar.OnSeekBarChangeListener{override fun onProgressChanged(s:SeekBar?,value:Int,fromUser:Boolean){strength.text="权重：${labels[value]}";invalidate();if(fromUser){prefs.edit().putInt("weight_"+name,value).apply();s?.stepFeedback()}};override fun onStartTrackingTouch(s:SeekBar?){};override fun onStopTrackingTouch(s:SeekBar?){}})};c.addView(slider,LinearLayout.LayoutParams(-1,dp(48)))
    val marks=LinearLayout(this).apply{orientation=LinearLayout.HORIZONTAL};labels.forEach{label->marks.addView(text(label,12,Color.GRAY).apply{gravity=Gravity.CENTER},LinearLayout.LayoutParams(0,-2,1f))};c.addView(marks);content.addView(c)}
+ }
+ private fun showLearning(){
+  val available=idleForReview()
+  fun addAction(group:LinearLayout,label:String,primary:Boolean=false,enabled:Boolean=available,action:()->Unit):TextView {
+   val view=button(label,primary,action).apply{isEnabled=enabled;alpha=if(enabled)1f else 0.45f}
+   group.addView(view,LinearLayout.LayoutParams(-1,dp(50)).apply{topMargin=dp(10)})
+   return view
+  }
+  val pending=card()
+  pending.addView(text("声纹持续学习",19,Color.BLACK).apply{setTypeface(null,Typeface.BOLD)})
+  pending.addView(AppleSwitch().apply{
+   text="自动学习";textSize=16f;setTextColor(Color.BLACK);styleSwitch(this)
+   isChecked=prefs.getBoolean("auto_voice_learning",true)
+   setOnCheckedChangeListener{_,checked->prefs.edit().putBoolean("auto_voice_learning",checked).apply();invalidate()}
+  },LinearLayout.LayoutParams(-1,dp(48)).apply{topMargin=dp(8)})
+  pending.addView(text("识别结束后自动审核已登记人物的高可信片段，符合条件才追加，下一次识别生效。未通过的候选仍可手动确认；关闭后仅停止自动追加。初始声纹保留。",13,Color.GRAY).apply{setPadding(0,dp(8),0,0);setLineSpacing(dp(3).toFloat(),1f)})
+  val count=runCatching{VoiceLearningStore.listCandidates(this).size}.getOrNull()
+  learningCandidatesAction=addAction(pending,if(count==null)"待确认学习片段" else "待确认学习片段 · ${count}条",true){voiceEnrollment.showCandidates()}
+  if(!available)pending.addView(text("请先结束当前识别或声纹处理。",12,Color.GRAY).apply{setPadding(0,dp(8),0,0)})
+  content.addView(pending)
+  val correction=card()
+  correction.addView(text("更正最近转写",18,Color.BLACK).apply{setTypeface(null,Typeface.BOLD)})
+  correction.addView(text("选择发言并指定已登记人物；仅通过单人及质量检查的候选可以确认加入学习。",13,Color.GRAY).apply{setPadding(0,dp(8),0,0);setLineSpacing(dp(3).toFloat(),1f)})
+  learningAction=addAction(correction,"更正说话人与学习",enabled=available&&reviewRows.isNotEmpty()){showLearningCorrections()}
+  if(reviewRows.isEmpty())correction.addView(text("完成一次录音或文件识别后可更正。",12,Color.GRAY).apply{setPadding(0,dp(8),0,0)})
+  content.addView(correction)
+  val management=card()
+  management.addView(text("学习样本",18,Color.BLACK).apply{setTypeface(null,Typeface.BOLD)})
+  management.addView(text("补录、删除补充样本或撤销学习，可在声纹管理中选择对应人物操作。",13,Color.GRAY).apply{setPadding(0,dp(8),0,0);setLineSpacing(dp(3).toFloat(),1f)})
+  learningManageAction=addAction(management,"管理学习样本"){voiceEnrollment.show()}
+  learningEvaluationAction=addAction(management,"学习前后本地对照"){learningEvaluation.show()}
+  content.addView(management)
  }
  private fun showVoiceSettings(){
   data class Setting(val key:String,val title:String,val description:String,val defaultValue:Int,
@@ -609,8 +648,8 @@ class MainActivity:Activity(){
    "声纹相似度低于此值时才允许新建匿名说话人。数值越低，新建越严格。",SpeakerDefaults.NEW_MAX_PERCENT)
   addSetting("speaker_min_margin","多个说话人最小分差",
    "已有多个候选组时，最佳与次佳相似度至少相差此值；也用于离线最终归组筛选。",SpeakerDefaults.MARGIN_PERCENT)
-  addSetting("speaker_group_threshold","说话人切分聚类阈值",
-   "仅控制说话人活动切分使用的离线聚类，与上面的声纹归组规则独立。",SpeakerDefaults.NATIVE_SIMILARITY_PERCENT)
+  addSetting("speaker_group_threshold","匿名声音聚合门槛",
+   "匹配匿名人物时需同时达到此值和已有说话人匹配下限；数值越高越难合并。",SpeakerDefaults.NATIVE_SIMILARITY_PERCENT)
   val controls=card()
   controls.addView(text("范围0.00—1.00，步长0.01。新建上限必须低于已有匹配下限和短片段固定下限0.40；无法满足判断条件的片段保留未确定状态。",12,Color.GRAY).apply{setLineSpacing(dp(3).toFloat(),1f)})
   controls.addView(button("保存设置",true){
@@ -683,7 +722,7 @@ class MainActivity:Activity(){
   toggle(speaker,"细分连续说话人（实验）","live_speaker_turns")
   note(speaker,"需同时开启VAD和声纹区分。连续发言会按人细分，处理耗时可能增加。")
   action(speaker,"声纹模型：${SpeakerModels.name(selectedSpeakerModel())}"){chooseSpeakerModel()}
-  action(speaker,"声纹阈值与登记"){page=2;render()}
+  action(speaker,"声纹阈值与登记"){page=3;render()}
   modelInfo(speaker,"CAM++（26.97MiB）和ERes2NetV2（68.13MiB）提取声纹特征。说话人切分使用pyannote（5.72MiB）检测活动区间。\n\n短于或等于10秒的离线切分仅输出窗口内编号。预测重叠时难以区分每句话的归属。声纹阈值需要结合录音场景校准。")
 
   CloudModelSettingsUi.addSettings(this,section("云端模型"))
@@ -703,7 +742,7 @@ class MainActivity:Activity(){
   }
  }
  private fun requestStart(){if(checkSelfPermission(Manifest.permission.RECORD_AUDIO)!=PackageManager.PERMISSION_GRANTED){requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO),31);return};start()}
- override fun onRequestPermissionsResult(r:Int,p:Array<out String>,g:IntArray){super.onRequestPermissionsResult(r,p,g);if(r==31){if(g.isNotEmpty()&&g[0]==PackageManager.PERMISSION_GRANTED)start() else {status="需要麦克风权限";render()}} else if(r==VoiceEnrollmentDialog.PERMISSION_REQUEST){voiceEnrollment.onPermissionResult(g.isNotEmpty()&&g[0]==PackageManager.PERMISSION_GRANTED)}}
+ override fun onRequestPermissionsResult(r:Int,p:Array<out String>,g:IntArray){super.onRequestPermissionsResult(r,p,g);if(r==VoiceLearningEvaluationUi.PERMISSION){learningEvaluation.onPermissionResult(g.isNotEmpty()&&g[0]==PackageManager.PERMISSION_GRANTED);return};if(r==31){if(g.isNotEmpty()&&g[0]==PackageManager.PERMISSION_GRANTED)start() else {status="需要麦克风权限";render()}} else if(r==VoiceEnrollmentDialog.PERMISSION_REQUEST){voiceEnrollment.onPermissionResult(g.isNotEmpty()&&g[0]==PackageManager.PERMISSION_GRANTED)}}
  override fun onPostCreate(savedInstanceState:Bundle?){
   super.onPostCreate(savedInstanceState)
   if(android.os.Build.VERSION.SDK_INT>=33){
@@ -713,13 +752,13 @@ class MainActivity:Activity(){
  @Suppress("DEPRECATION")
  private fun handleAppBack(){
   window.decorView.tapFeedback()
-  if(!voiceEnrollment.handleBack())super.onBackPressed()
+  if(!learningEvaluation.handleBack()&&!voiceEnrollment.handleBack())super.onBackPressed()
  }
  @Deprecated("Android legacy back callback")
  override fun onBackPressed(){handleAppBack()}
  private fun stop(){startRequested=false;if(diarizationRunning){setStatus("正在结束，等待当前处理完成…");return};active.set(false);setStatus("正在结束并刷新尾句…")}
- override fun onStop(){ramMonitor?.shutdownNow();ramMonitor=null;super.onStop();voiceEnrollment.cancel();if(active.get() || startRequested)stop()}
- override fun onDestroy(){updateUi.close();voiceEnrollment.cancel();destroyed=true;polishWorker?.interrupt();active.set(false);startRequested=false;super.onDestroy()}
+ override fun onStop(){ramMonitor?.shutdownNow();ramMonitor=null;super.onStop();voiceEnrollment.cancel();learningEvaluation.cancel();VoiceLearningCorrectionsUi.cancel();if(active.get() || startRequested)stop()}
+ override fun onDestroy(){updateUi.close();voiceEnrollment.cancel();learningEvaluation.cancel();VoiceLearningCorrectionsUi.cancel();learningRun?.cancel();destroyed=true;polishWorker?.interrupt();active.set(false);startRequested=false;super.onDestroy()}
  private fun ensureModels():File{val dir=File(filesDir,"model-1920");dir.mkdirs();for(n in listOf("encoder-1920ms.onnx","decoder-1920ms.onnx","joiner-1920ms.onnx","tokens.txt","bpe.vocab")){val file=File(dir,n);if(!file.exists()||file.length()==0L){val tmp=File(dir,"$n.tmp");assets.open("models/1920/$n").use{input->tmp.outputStream().use{input.copyTo(it)}};check(tmp.renameTo(file)){"模型文件准备失败"}}};return dir}
  private fun words():List<Pair<String,Float>>{val out=linkedMapOf<String,Float>();val selected=prefs.getStringSet("selected",emptySet())!!;fun add(w:String,score:Float){if(w.isNotEmpty())out[w]=maxOf(out[w]?:0f,score)};groups.forEach{(k,v)->if(k in selected){val score=listOf(1f,2f,3f,4f)[prefs.getInt("weight_"+k,0).coerceIn(0,3)];v.split(',').forEach{add(it.trim(),score)}}};if(prefs.getBoolean("customEnabled",false)){val score=listOf(1f,2f,3f,4f)[prefs.getInt("weight_custom",0).coerceIn(0,3)];prefs.getString("custom","")!!.lines().map{it.trim()}.forEach{add(it,score)}};return out.map{it.key to it.value}}
  private fun hotwordString(terms:List<Pair<String,Float>>):String {
@@ -763,17 +802,23 @@ class MainActivity:Activity(){
     if(!startRequested)throw InterruptedException("已停止")
     val dir=ensureModels();val hot=if(terms.isEmpty())"" else hotwordString(terms)
     setStatus("正在本地识别并切分说话人…")
-    val outcome=TimeAlignedAsr.process(assets,samples,dir,speakerKey,hot,vadKey,cancelled={!startRequested},context=this@MainActivity,speakerThreshold=threshold,decisionConfig=decisionConfig)
+    val (outcome,pureCandidates,unresolvedCandidates)=TimeAlignedAsr.Session(assets,dir,speakerKey,hot,vadKey,context=this@MainActivity,speakerThreshold=threshold,decisionConfig=decisionConfig).use{session->
+     val data=session.process(samples,cancelled={!startRequested},source=uri.toString())
+     Triple(data,session.takeLearningCandidates(),session.takeUnresolvedLearningCandidates())
+    }
     outcome.put("speaker_decision_config",speakerDecisionJson(decisionConfig))
     if(!startRequested)throw InterruptedException("已停止")
     val runs=File(getExternalFilesDir(null),"runs");runs.mkdirs()
+    learningRun?.collectPrioritized(outcome.getJSONArray("speaker_turn_transcripts"),pureCandidates,unresolvedCandidates,uri.toString(),"")
+    learningRun?.collectFileSpanning(outcome.getJSONArray("speaker_turn_transcripts"),pureCandidates,unresolvedCandidates,uri.toString(),"")
+    learningRun?.finish()
     val result=TranscriptPresentation.render(SpeakerTranscript.aligned(outcome))
     outcome.put("transcript_text",result).put("transcript_scope","speaker_turns_only")
     val runName="aligned-${System.currentTimeMillis()}"
     File(runs,"$runName.json").writeText(outcome.toString())
     File(runs,"$runName.txt").writeText(result)
     reviewRows=TranscriptReview.fromResult(outcome)
-    setResult(result);setStatus("说话人分段转写完成 · ${outcome.getDouble("total_ms").toLong()}毫秒")
+    setResult(result);setStatus(listOfNotNull("说话人分段转写完成 · ${outcome.getDouble("total_ms").toLong()}毫秒",learningRun?.summary()).joinToString(" · "))
    }catch(e:Throwable){setStatus(if(e is InterruptedException)"已停止" else "转写与说话人关联失败：${e.message?:e.javaClass.simpleName}");android.util.Log.e("HotwordTest","alignment failed",e)}
    finally{diarizationRunning=false;active.set(false);startRequested=false;runOnUiThread{recognitionBusy=false;if(!destroyed)render()}}
   }.start()
@@ -863,6 +908,7 @@ class MainActivity:Activity(){
  }
  override fun onActivityResult(requestCode:Int,resultCode:Int,data:Intent?){
   super.onActivityResult(requestCode,resultCode,data)
+  if(learningEvaluation.onActivityResult(requestCode,resultCode,data))return
   if(resultCode!=Activity.RESULT_OK)return
   val uri=data?.data?:return
   when(requestCode){
@@ -948,34 +994,35 @@ class MainActivity:Activity(){
   if(!idleForReview())return;beginRecognition("文件导入");val useVad=if(probe&&intent.hasExtra("probeVad"))intent.getBooleanExtra("probeVad",false) else prefs.getBoolean("file_vad",true);val useSpeaker=useVad && if(probe&&intent.hasExtra("probeSpeaker"))intent.getBooleanExtra("probeSpeaker",false) else prefs.getBoolean("speaker_enabled",true);val speakerKey=if(probe&&intent.hasExtra("probeSpeakerModel"))SpeakerModels.normalize(intent.getStringExtra("probeSpeakerModel")) else selectedSpeakerModel();val vadKey=if(probe&&intent.hasExtra("probeVadModel"))VadModelFactory.normalize(intent.getStringExtra("probeVadModel")) else selectedVadModel();val threshold=if(probe)LocalSpeakerTracker.EXPERIMENTAL_THRESHOLD else speakerThreshold();val decisionConfig=if(probe)SpeakerDecisionConfig() else speakerDecisionConfig();startRequested=true;active.set(true);page=0;status="正在读取文件…";transcript="";render();val terms=if(probe&&intent.getBooleanExtra("probeNoHotwords",false))emptyList() else words()
   val useTurns=useSpeaker && if(probe)intent.getBooleanExtra("probeSpeakerTurns",false) else prefs.getBoolean("live_speaker_turns",true)
   val untimedFiles=org.json.JSONArray()
-  Thread {var engine:OnlineRecognizer?=null;var speaker:LocalSpeakerTracker?=null;var aligned:TimeAlignedAsr.Session?=null;val tmp=File(cacheDir,"import-"+System.nanoTime());tmp.mkdirs();val results=org.json.JSONArray();val output=StringBuilder();var message=""
+  Thread {var engine:OnlineRecognizer?=null;var speaker:LocalSpeakerTracker?=null;var basicVoice:StableSpeakerAssignments?=null;var aligned:TimeAlignedAsr.Session?=null;val tmp=File(cacheDir,"import-"+System.nanoTime());tmp.mkdirs();val results=org.json.JSONArray();val output=StringBuilder();var message=""
    try {
     val inputFile=File(tmp,"source");(if(uri.scheme=="file")File(uri.path!!).inputStream() else contentResolver.openInputStream(uri)?:error("无法打开所选文件")).use{ input-> inputFile.outputStream().use { copyLimited(input,it,512L*1024*1024) } }
-    val files=mutableListOf<Pair<String,File>>()
+    // Preserve the actual ZIP entry ordinal even after display-name sorting.
+    val files=mutableListOf<Triple<String,File,Int?>>()
     if(name.lowercase().endsWith(".zip")) {
      var expanded=0L;var count=0
      ZipInputStream(inputFile.inputStream().buffered()).use { zip->
       while(true){if(!startRequested)throw InterruptedException("已停止");val entry=zip.nextEntry?:break;count++;require(count<=1000){"ZIP条目超过1000个"}
        val entryName=entry.name.replace('\\','/');val parts=entryName.split('/');require(!entryName.startsWith('/')&&!entryName.contains(':')&&parts.none{it==".."||it=="."}&&!entryName.contains('\u0000')){"ZIP包含不安全路径"}
        if(!entry.isDirectory && entryName.lowercase().endsWith(".wav")){
-        val target=File(tmp,"item-${count}.wav");val bytes=target.outputStream().use { copyLimited(zip,it,minOf(50L*1024*1024,1024L*1024*1024-expanded)) };expanded+=bytes;files.add(entryName to target)
+        val target=File(tmp,"item-${count}.wav");val bytes=target.outputStream().use { copyLimited(zip,it,minOf(50L*1024*1024,1024L*1024*1024-expanded)) };expanded+=bytes;files.add(Triple(entryName,target,count))
        } else if(!entry.isDirectory) {expanded+=copyLimited(zip,object:java.io.OutputStream(){override fun write(b:Int){};override fun write(b:ByteArray,off:Int,len:Int){}},minOf(50L*1024*1024,1024L*1024*1024-expanded))}
        require(expanded<=1024L*1024*1024){"ZIP解压超过1024MiB"};zip.closeEntry()
       }
      }
-    } else {require(name.lowercase().endsWith(".wav")){"请选择WAV或ZIP"};require(inputFile.length()<=50L*1024*1024){"单个WAV超过50MiB"};files.add(name to inputFile)}
+    } else {require(name.lowercase().endsWith(".wav")){"请选择WAV或ZIP"};require(inputFile.length()<=50L*1024*1024){"单个WAV超过50MiB"};files.add(Triple(name,inputFile,null))}
     require(files.isNotEmpty()){ "文件中没有WAV" };files.sortBy{it.first}
     val model=ensureModels();if(!startRequested)throw InterruptedException("已停止");val hot=if(terms.isNotEmpty())hotwordString(terms) else ""
     setStatus("加载模型，准备识别${files.size}条音频…")
     if(useTurns)aligned=TimeAlignedAsr.Session(assets,model,speakerKey,hot,vadKey,context=this@MainActivity,speakerThreshold=threshold,decisionConfig=decisionConfig)
     else{
      engine=OnlineRecognizer(config=OnlineRecognizerConfig(featConfig=FeatureConfig(sampleRate=16000,featureDim=80),modelConfig=OnlineModelConfig(transducer=OnlineTransducerModelConfig(encoder=File(model,"encoder-1920ms.onnx").path,decoder=File(model,"decoder-1920ms.onnx").path,joiner=File(model,"joiner-1920ms.onnx").path),tokens=File(model,"tokens.txt").path,numThreads=2,provider="cpu",modelType="zipformer2",modelingUnit=if(hot.isEmpty())"" else "bpe",bpeVocab=if(hot.isEmpty())"" else File(model,"bpe.vocab").path),enableEndpoint=false,decodingMethod=if(hot.isEmpty())"greedy_search" else "modified_beam_search",maxActivePaths=4,hotwordsScore=4.0f))
-     if(useSpeaker)speaker=LocalSpeakerTracker(assets,speakerKey,threshold,decisionConfig)
+     if(useSpeaker)basicVoice=StableSpeakerAssignments(assets,this@MainActivity,speakerKey,decisionConfig)
     }
     var nextStart=0L
     var silentFiles=0
     var firstFailure=""
-    files.forEachIndexed { index,(label,file)->
+    files.forEachIndexed { index,(label,file,zipOrdinal)->
      if(!startRequested)throw InterruptedException("已停止")
      val progressLabel="第${index+1}条录音，共${files.size}条"
      setStatus("正在识别$progressLabel")
@@ -991,26 +1038,30 @@ class MainActivity:Activity(){
       sampleCount=samples.size
       nextStart+=samples.size
       if(!startRequested)throw InterruptedException("已停止")
+      val sourceIdentity=if(zipOrdinal!=null)FileSourceIdentity.zipEntry(uri.toString(),zipOrdinal,label) else FileSourceIdentity.singleFile(uri.toString())
       if(useTurns){
-       aligned!!.process(samples,cancelled={!startRequested},progress=progress).put("mode","speaker_turns")
+       val data=aligned!!.process(samples,cancelled={!startRequested},progress=progress,source=sourceIdentity).put("mode","speaker_turns")
         .put("transcript_scope","speaker_turns_only").put("speaker_decision_config",speakerDecisionJson(decisionConfig))
+       val pure=aligned!!.takeLearningCandidates();val unresolved=aligned!!.takeUnresolvedLearningCandidates()
+       if(!probe){learningRun?.collectPrioritized(data.getJSONArray("speaker_turn_transcripts"),pure,unresolved,sourceIdentity,label,offset)
+        learningRun?.collectFileSpanning(data.getJSONArray("speaker_turn_transcripts"),pure,unresolved,sourceIdentity,label,offset)}
+       data
       }else if(useVad){
        val recognizer=checkNotNull(engine)
        val previousFiles=output.toString()
        fun preview(partial:String=""){
         setResult(listOf(previousFiles,completedLines.joinToString("\n"),partial).filter{it.isNotBlank()}.joinToString("\n"))
        }
+       val pure=basicVoice?.observe(samples,sourceIdentity).orEmpty()
+       val unresolved=basicVoice?.takeUnresolvedLearningCandidates(sourceIdentity).orEmpty()
        val outcome=VadFilePipeline(assets,vadKey).process(samples,recognizer,hot,cancelled={!startRequested},
         onPartial={_,start,end,current->
          preview(batchLine(start.toLong(),end.toLong(),offset,if(useSpeaker)"待确认" else "未区分",current))
         },onFinal={segment->
          val row=segment.json()
-         speaker?.let{tracker->
-          val group=if(segment.text.isBlank())org.json.JSONObject().put("speaker_id",org.json.JSONObject.NULL)
-           .put("speaker_status","empty_asr_not_grouped").put("threshold",org.json.JSONObject.NULL)
-          else tracker.assignConservative(samples.copyOfRange(segment.vadStartSample,segment.vadEndSample))
-          row.put("speaker_id",group.opt("speaker_id")).put("speaker_status",group.optString("speaker_status"))
-           .put("speaker_similarity",group.opt("similarity_to_previous")).put("speaker_threshold",group.opt("threshold"))
+         basicVoice?.let{resolver->
+          val resolved=resolver.resolve(org.json.JSONArray().put(row),sourceIdentity,final=true).getJSONObject(0)
+          val keys=resolved.keys();while(keys.hasNext()){val key=keys.next();row.put(key,resolved.get(key))}
          }
          fileSegments.put(row)
          if(segment.text.isNotBlank()){
@@ -1021,6 +1072,8 @@ class MainActivity:Activity(){
         })
        val data=outcome.json().put("segments",fileSegments).put("mode","vad_segments")
         .put("decoding",if(hot.isEmpty())"greedy_search" else "modified_beam_search")
+       if(!probe&&useSpeaker){learningRun?.collectPrioritized(fileSegments,pure,unresolved,sourceIdentity,label,offset)
+        learningRun?.collectFileSpanning(fileSegments,pure,unresolved,sourceIdentity,label,offset)}
        if(useSpeaker)data.put("speaker_decision_config",speakerDecisionJson(decisionConfig))
         .put("speaker_status","experimental_segment_assignment").put("speaker_model",SpeakerModels.name(speakerKey))
         .put("speaker_threshold_status","uncalibrated")
@@ -1047,7 +1100,7 @@ class MainActivity:Activity(){
        .put("error",e.message?:"未知错误").put("segments",fileSegments)
      }finally{progress?.finish();stream?.release()}
 
-     record.put("file",label).put("file_order",index+1)
+     record.put("file",label).put("file_order",index+1).put("zip_entry_ordinal",zipOrdinal?:org.json.JSONObject.NULL)
      val count=sampleCount
      if(count==null){
       untimedFiles.put(label)
@@ -1077,15 +1130,16 @@ class MainActivity:Activity(){
     } 
    }catch(e:Throwable){message=if(e is InterruptedException)"已停止" else "导入失败：${e.message}";android.util.Log.e("HotwordTest","batch failed",e)}
    finally {
-    try{aligned?.close()}catch(_:Exception){};try{speaker?.close()}catch(_:Exception){};try{engine?.release()}catch(_:Exception){}
+    try{aligned?.close()}catch(_:Exception){};try{basicVoice?.close();speaker?.close()}catch(_:Exception){};try{engine?.release()}catch(_:Exception){}
     tmp.listFiles()?.forEach{it.delete()};tmp.delete()
+    if(!probe){setStatus("转写完成，正在本地筛选声纹候选…");learningRun?.finish();message+=" · "+(learningRun?.summary()?:"")}
     startRequested=false;active.set(false);setResult(output.toString());setStatus(message)
     val used=org.json.JSONArray()
     terms.forEach{(word,score)->used.put(org.json.JSONObject().put("word",word).put("score",score.toDouble()))}
     val shownOutput=TranscriptPresentation.render(output.toString())
     val payload=org.json.JSONObject().put("status",message)
      .put("mode",if(useTurns)"speaker_turns" else if(useVad)"vad_segments" else "whole_file")
-     .put("transcript_text",shownOutput)
+     .put("transcript_text",shownOutput).put("voice_learning",if(probe)org.json.JSONObject.NULL else learningRun?.json())
      .put("transcript_scope",if(useTurns)"speaker_turns_only" else if(useVad)"vad_segments" else "whole_file")
      .put("merged_time_basis","顺序拼接可读取WAV的16kHz采样时长，单文件记录内为相对时间")
      .put("time_excluded_files",untimedFiles)
@@ -1142,7 +1196,7 @@ class MainActivity:Activity(){
      catch(e:Exception){liveSpeakerError=e.message?:"声纹模型加载失败";android.util.Log.e("HotwordTest","实时声纹初始化失败，继续转写",e)}
      if(!startRequested)return@Thread
     }
-    if(turnMode){setStatus("正在加载说话人切分模型…");turnSplitter=LiveSpeakerTurnSegmenter(assets,speakerKey,threshold);if(!startRequested)return@Thread}
+    if(turnMode){setStatus("正在加载说话人切分模型…");turnSplitter=LiveSpeakerTurnSegmenter(assets,speakerKey,threshold,context=applicationContext);if(!startRequested)return@Thread}
     val min=AudioRecord.getMinBufferSize(16000,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT);check(min>0){"设备不支持16kHz单声道录音"};recorder=AudioRecord(MediaRecorder.AudioSource.MIC,16000,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT,maxOf(min,6400));check(recorder.state==AudioRecord.STATE_INITIALIZED){"麦克风初始化失败"};recorder.startRecording();active.set(true);setStatus("正在录音，请说话 · ${if(h==null)"无热词" else "热词${terms.size}个"}");setResult("")
     val queue=java.util.concurrent.ArrayBlockingQueue<FloatArray>(if(turnMode)1200 else 400)
     val overflow=AtomicBoolean(false)
@@ -1168,7 +1222,7 @@ class MainActivity:Activity(){
     }
     reader.start();var previous=""
     if(useVad){
-      val segments=org.json.JSONArray();val displayedTurns=org.json.JSONArray();val finished=StringBuilder();var observed=0L;val speaker=liveSpeaker;var splitBacklogCount=0;var splitErrorCount=0
+      val segments=org.json.JSONArray();var displayedTurns=org.json.JSONArray();val finished=StringBuilder();var observed=0L;val speaker=liveSpeaker;var splitBacklogCount=0;var splitErrorCount=0
      val segmenter=VadLiveSegmenter(assets,vadKey,if(turnSplitter!=null)5*16000 else 0){seg->
       val local=engine.createStream(h?:"")
        try{
@@ -1188,25 +1242,32 @@ class MainActivity:Activity(){
        var splitFailed=splitBacklog
        if(splitBacklog){splitBacklogCount++;setStatus("处理积压：本段未完成说话人切分")}
        if(turnSplitter!=null&&t.isNotBlank()&&!splitBacklog){
-        val splitStart=System.nanoTime();val previousGroups=speaker?.snapshotAnonymousGroups()
+        val splitStart=System.nanoTime()
         try{
-         val split=turnSplitter!!.split(seg)
-         val turns=describeSpeakerTurns(seg,split,t,engine,h,speaker)
+         val rawSplit=turnSplitter!!.split(seg,source=learningLiveSource)
+         val pure=speaker?.observe(seg.contextAudio,learningLiveSource,seg.contextStartSample,rawSplit.evidence).orEmpty()
+         val unresolved=speaker?.takeUnresolvedLearningCandidates(learningLiveSource).orEmpty()
+         val split=if(speaker!=null)turnSplitter!!.split(seg,rawSplit.evidence,learningLiveSource,speaker.activityEvidence(learningLiveSource)) else rawSplit
+         val turns=describeSpeakerTurns(seg,split,t,engine,h)
+         // Use actual resolver evidence for learning; preserve the original turn
+         // rows and existing display/re-resolution behavior.
+         val learningTurns=speaker?.resolve(turns,learningLiveSource)?:turns
+         learningRun?.collectPrioritized(learningTurns,pure,unresolved,learningLiveSource,"")
          val record=org.json.JSONObject().put("index",seg.index).put("start_sample",seg.startSample).put("end_sample",seg.endSample)
           .put("start_ms",seg.startSample*1000/16000).put("end_ms",seg.endSample*1000/16000)
           .put("vad_start_sample",seg.vadStartSample).put("vad_end_sample",seg.vadEndSample)
           .put("text",t).put("original_vad_text",t).put("speaker_turns",turns)
           .put("speaker_status","speaker_activity_split_experimental").put("identity_status","unverified")
           .put("context_start_sample",split.contextStart).put("context_end_sample",split.contextEnd)
-          .put("diarization_ms",split.inferenceMs).put("speaker_turns_total_ms",(System.nanoTime()-splitStart)/1000000.0)
+          .put("diarization_ms",if(speaker!=null)rawSplit.inferenceMs+split.inferenceMs else rawSplit.inferenceMs).put("speaker_turns_total_ms",(System.nanoTime()-splitStart)/1000000.0)
           .put("audio_queue_blocks",queue.size).put("word_timestamps",org.json.JSONObject.NULL)
          segments.put(record)
          for(i in 0 until turns.length())displayedTurns.put(turns.getJSONObject(i))
-         val lines=SpeakerTranscript.live(turns)
-         if(lines.isNotBlank())finished.append(lines).append("\n")
+         displayedTurns=speaker?.resolve(displayedTurns,learningLiveSource)?:displayedTurns
+         finished.setLength(0);finished.append(SpeakerTranscript.live(displayedTurns)).append("\n")
          setResult(finished.toString())
          return@VadLiveSegmenter
-        }catch(e:Exception){splitFailed=true;splitErrorCount++;try{if(previousGroups!=null)speaker?.restoreAnonymousGroups(previousGroups)}catch(restore:Exception){throw IllegalStateException("声纹状态恢复失败",restore)};android.util.Log.e("HotwordTest","细分失败，原VAD结果仅保留在诊断记录",e)}
+        }catch(e:Exception){splitFailed=true;splitErrorCount++;android.util.Log.e("HotwordTest","细分失败，原VAD结果仅保留在诊断记录",e)}
        }
        // Split mode never displays a whole-VAD fallback as a speaker turn.
        // Retain diagnostics and explicitly report incomplete intervals instead.
@@ -1220,6 +1281,8 @@ class MainActivity:Activity(){
         setResult(finished.toString());return@VadLiveSegmenter
        }
        val voiceStart=System.nanoTime()
+       var livePure=emptyList<SpeechEvidence.PureCandidate>()
+       var liveUnresolved=emptyList<SpeechEvidence.PureCandidate>()
        // Empty ASR output is not proof of music or silence: do not let an
        // untranscribed segment create or change anonymous voice groups.
        val voice=if(splitFailed) org.json.JSONObject()
@@ -1232,13 +1295,24 @@ class MainActivity:Activity(){
         .put("identity",org.json.JSONObject().put("status","not_evaluated_empty_asr"))
         .put("display","无文字")
         .put("voice_gate","ASR结果为空，未进行声纹归组；不表示没有语音或一定是音乐")
-       else try{speaker?.classify(seg.samples)}catch(e:Exception){android.util.Log.e("HotwordTest","实时声纹识别失败，继续转写",e);null}
+       else try{
+        speaker?.classifyWithEvidence(seg.samples,learningLiveSource,seg.startSample)?.let{classified->
+         livePure=classified.pureCandidates
+         liveUnresolved=classified.unresolvedCandidates
+         classified.voice
+        }
+       }catch(e:Exception){android.util.Log.e("HotwordTest","实时声纹识别失败，继续转写",e);null}
        val voiceMs=(System.nanoTime()-voiceStart)/1000000.0
        val sp=voice?.optJSONObject("speaker")
        val identity=voice?.optJSONObject("identity")
        val display=if(!speakerEnabled)"" else voice?.optString("display")?:"待确认"
         val record=org.json.JSONObject().put("index",seg.index).put("start_sample",seg.startSample).put("end_sample",seg.endSample).put("start_ms",seg.startSample*1000/16000).put("end_ms",seg.endSample*1000/16000).put("vad_start_sample",seg.vadStartSample).put("vad_end_sample",seg.vadEndSample).put("overlap_clipped",seg.overlapClipped).put("text",t).put("speaker_id",sp?.opt("speaker_id")?:org.json.JSONObject.NULL).put("speaker_status",sp?.optString("speaker_status")?:if(speakerEnabled)"comparison_failed" else "not_implemented").put("speaker_similarity",sp?.opt("similarity_to_previous")?:org.json.JSONObject.NULL).put("speaker_threshold",sp?.opt("threshold")?:org.json.JSONObject.NULL).put("speaker_display",if(display.isEmpty())org.json.JSONObject.NULL else display).put("voice_identity",identity?:org.json.JSONObject.NULL).put("voice_gate",voice?.opt("voice_gate")?:org.json.JSONObject.NULL).put("single_speaker_status","not_verified").put("overlap_status","not_checked").put("voice_process_ms",voiceMs).put("audio_queue_blocks",queue.size).put("word_timestamps",org.json.JSONObject.NULL).put("confidence",org.json.JSONObject.NULL)
         segments.put(record)
+        if(t.isNotBlank()){
+         val rows=org.json.JSONArray().put(record)
+         learningRun?.collectClassifiedLive(rows,livePure,if(speaker!=null&&!splitFailed)voice else null,learningLiveSource,"")
+         learningRun?.collectUnresolvedClassifiedLive(rows,livePure,liveUnresolved,if(speaker!=null&&!splitFailed)voice else null,learningLiveSource,"")
+        }
         val label=SpeakerTranscript.segmentLabel(record).ifBlank{"未区分"}
         val line=SpeakerTranscript.line(startMs,endMs,label,t)
         if(line.isNotEmpty())finished.append(line).append('\n')
@@ -1246,7 +1320,14 @@ class MainActivity:Activity(){
       }finally{local.release()}
      }
      try{setStatus(if(liveSpeakerError!=null)"声纹不可用，继续转写；语音停顿后提交片段" else "VAD已开启：语音停顿后提交片段");while(reader.isAlive||queue.isNotEmpty()){val samples=queue.poll(100,java.util.concurrent.TimeUnit.MILLISECONDS)?:continue;segmenter.accept(samples)};reader.join();captureError.get()?.let{throw IllegalStateException(it)};segmenter.finish();observed=segmenter.inputSamples()}finally{segmenter.close()}
-     recorder.stop();val payload=org.json.JSONObject().put("status",if(overflow.get())"queue_overflow" else "completed").put("mode","live_vad_segments").put("speaker_split_backlog_skipped",splitBacklogCount).put("speaker_split_failures",splitErrorCount).put("vad_model",VadModelFactory.name(vadKey)).put("sample_rate",16000).put("input_samples",observed).put("segments",segments).put("speaker_status",if(speaker!=null)"experimental_segment_assignment" else if(speakerEnabled)"initialization_failed" else "not_implemented").put("speaker_error",liveSpeakerError?:org.json.JSONObject.NULL).put("speaker_model",if(speakerEnabled)SpeakerModels.name(speakerKey) else org.json.JSONObject.NULL).put("speaker_threshold_status",if(speaker==null)org.json.JSONObject.NULL else "uncalibrated").put("speaker_clustering_threshold",if(turnSplitter==null)org.json.JSONObject.NULL else threshold).put("identity_status",if(!speakerEnabled)"not_implemented" else if(speaker==null)"initialization_failed" else "experimental_vad_segment_candidate").put("single_speaker_status",if(speakerEnabled)"not_verified" else "not_applicable").put("overlap_status",if(turnSplitter!=null)"predicted_per_turn" else if(speakerEnabled)"not_checked" else "not_applicable").put("word_timestamp_status","not_implemented").put("time_source","本次录音采样偏移；片段边界非词级时间").put("partial_scope","VAD关闭片段后的识别中间结果")
+     recorder.stop()
+     if(turnMode){
+      displayedTurns=speaker?.resolve(displayedTurns,learningLiveSource,final=true)?:displayedTurns
+      finished.setLength(0);finished.append(SpeakerTranscript.live(displayedTurns)).append("\n")
+     }
+     setStatus("录音已结束，正在本地筛选声纹候选…")
+     learningRun?.finish()
+     val payload=org.json.JSONObject().put("voice_learning",learningRun?.json()).put("status",if(overflow.get())"queue_overflow" else "completed").put("mode","live_vad_segments").put("speaker_split_backlog_skipped",splitBacklogCount).put("speaker_split_failures",splitErrorCount).put("vad_model",VadModelFactory.name(vadKey)).put("sample_rate",16000).put("input_samples",observed).put("segments",segments).put("speaker_status",if(speaker!=null)"experimental_segment_assignment" else if(speakerEnabled)"initialization_failed" else "not_implemented").put("speaker_error",liveSpeakerError?:org.json.JSONObject.NULL).put("speaker_model",if(speakerEnabled)SpeakerModels.name(speakerKey) else org.json.JSONObject.NULL).put("speaker_threshold_status",if(speaker==null)org.json.JSONObject.NULL else "uncalibrated").put("speaker_clustering_threshold",if(turnSplitter==null)org.json.JSONObject.NULL else threshold).put("identity_status",if(!speakerEnabled)"not_implemented" else if(speaker==null)"initialization_failed" else "experimental_vad_segment_candidate").put("single_speaker_status",if(speakerEnabled)"not_verified" else "not_applicable").put("overlap_status",if(turnSplitter!=null)"predicted_per_turn" else if(speakerEnabled)"not_checked" else "not_applicable").put("word_timestamp_status","not_implemented").put("time_source","本次录音采样偏移；片段边界非词级时间").put("partial_scope","VAD关闭片段后的识别中间结果")
       val finalText=finished.toString().trimEnd('\n')
       payload.put("speaker_decision_config",speakerDecisionJson(decisionConfig))
        .put("transcript_scope",if(turnMode)"speaker_turns_only" else "vad_segments")
@@ -1259,7 +1340,7 @@ class MainActivity:Activity(){
       if(splitBacklogCount>0||splitErrorCount>0)details.add("${splitBacklogCount}段因积压未细分，${splitErrorCount}段细分失败")
       if(liveSpeakerError!=null)details.add("声纹模型不可用")
       if(finalText.isEmpty())details.add("未识别到可显示的文字")
-      setStatus((listOf(if(details.isEmpty())"识别完成" else "识别结束")+details).joinToString(" · "))
+      setStatus((listOf(if(details.isEmpty())"识别完成" else "识别结束")+details+listOfNotNull(learningRun?.summary())).joinToString(" · "))
       return@Thread
     }
     var inputSamples=0L

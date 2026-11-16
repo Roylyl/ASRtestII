@@ -2,49 +2,62 @@ package org.hotwordtest
 
 import android.content.Context
 import android.content.res.AssetManager
+import org.json.JSONArray
 import org.json.JSONObject
+import java.util.UUID
 
-/** One embedding per VAD segment, shared by anonymous clustering and enrolled-voice matching. */
-class LiveSpeakerLabeler(assets:AssetManager,context:Context,modelKey:String,groupingThreshold:Double=LocalSpeakerTracker.EXPERIMENTAL_THRESHOLD,decisionConfig:SpeakerDecisionConfig=SpeakerDecisionConfig()):AutoCloseable {
- private val model=SpeakerModels.normalize(modelKey)
- private val speaker=LocalSpeakerTracker(assets,modelKey,groupingThreshold,decisionConfig)
- // Keep anonymous ASR working even when registered profiles cannot be read.
- private val matcher=try{WearerVoiceStore.Matcher(context,modelKey,loadExtractor=false)}catch(_:Exception){null}
+/** Shared evidence/identity resolver for live and imported audio. */
+class LiveSpeakerLabeler(assets:AssetManager,context:Context,modelKey:String,
+ groupingThreshold:Double=LocalSpeakerTracker.EXPERIMENTAL_THRESHOLD,
+ decisionConfig:SpeakerDecisionConfig=SpeakerDecisionConfig()):AutoCloseable {
+ private val assignments=StableSpeakerAssignments(assets,context,modelKey,decisionConfig)
+ private val legacySource="live-labeler:"+UUID.randomUUID()
+ private var legacyPosition=0L
+ private val rowsBySource=linkedMapOf<String,JSONArray>()
 
- fun snapshotAnonymousGroups():org.json.JSONArray = speaker.snapshot()
- fun restoreAnonymousGroups(state:org.json.JSONArray) = speaker.restore(state)
+ data class Classification(val voice:JSONObject,val pureCandidates:List<SpeechEvidence.PureCandidate>,
+                           val unresolvedCandidates:List<SpeechEvidence.PureCandidate>)
 
- fun classify(samples:FloatArray,singleSpeakerVerified:Boolean=false):JSONObject {
-  val vector=try{speaker.embedding(samples)}catch(_:Exception){null}
-  val anonymous=try{
-   speaker.assignConservative(samples,vector,singleSpeakerVerified)
-  }catch(_:Exception){JSONObject().put("speaker_id",JSONObject.NULL).put("speaker_status","comparison_failed")}
-  // A live VAD segment may contain several speakers; no overlap/single-speaker check is performed.
-  val identity=try{matcher?.identifyEmbedding(vector,samples.size,true)}catch(_:Exception){null}
-   ?:JSONObject().put("status","comparison_failed")
-  identity.put("single_speaker_status",if(singleSpeakerVerified)"predicted_single" else "not_verified")
-   .put("overlap_status",if(singleSpeakerVerified)"predicted_nonoverlap" else "not_checked")
-   .put("note",if(singleSpeakerVerified)"说话人活动模型预测单人且无重叠；身份及预测均未人工确认" else "实时VAD整段声纹候选；未检测多人重叠，可能误认；阈值未经校准")
-  val name=if(identity.optString("status")=="wearer_candidate")identity.optString("display_name") else ""
-  val score=identity.optDouble("similarity",Double.NaN)
-  val margin=identity.optDouble("candidate_margin",Double.NaN)
-  val nearest=identity.optString("nearest_candidate_name","")
-  // CAM++ only: exploratory display band. This never changes uncertain into a match.
-  // If multiple profiles compete closely, do not show any name.
-  val lowCandidate=model==SpeakerModels.CAM && identity.optString("status")=="uncertain" &&
-   score.isFinite() && score>=0.45 && score<0.65 &&
-   (identity.isNull("runner_up_similarity") || (margin.isFinite() && margin>=0.08)) && nearest.isNotBlank()
-  identity.put("low_confidence_candidate_shown",lowCandidate)
-   .put("low_confidence_threshold",if(model==SpeakerModels.CAM)0.45 else JSONObject.NULL)
-   .put("low_confidence_threshold_status","experimental_uncalibrated")
-  val anonymousName=SpeakerTranscript.anonymousLabel(anonymous)
-  val display=when {
-   name.isNotBlank()->"$name（候选）"
-   lowCandidate->"$anonymousName · $nearest（低置信候选）"
-   else->anonymousName
-  }
-  return JSONObject().put("speaker",anonymous).put("identity",identity).put("display",display)
-   .put("single_speaker_status",if(singleSpeakerVerified)"predicted_single" else "not_verified").put("overlap_status",if(singleSpeakerVerified)"predicted_nonoverlap" else "not_checked")
+ fun observe(samples:FloatArray,source:String,startSample:Long=0L,evidence:SpeechEvidence?=null):List<SpeechEvidence.PureCandidate> =
+  assignments.observe(samples,source,startSample,evidence)
+
+ fun takeUnresolvedLearningCandidates(source:String):List<SpeechEvidence.PureCandidate> =
+  assignments.takeUnresolvedLearningCandidates(source)
+
+ fun activityEvidence(source:String):JSONObject = assignments.activityEvidence(source)
+
+ fun resolve(rows:JSONArray,source:String,offsetSamples:Long=0L,final:Boolean=false):JSONArray =
+  assignments.resolve(rows,source,offsetSamples,final)
+
+ /** One analysis supplies both the prediction and its protected candidate intervals. */
+ fun classifyWithEvidence(samples:FloatArray,source:String,startSample:Long):Classification {
+  val pure=observe(samples,source,startSample)
+  val unresolved=takeUnresolvedLearningCandidates(source)
+  val end=Math.addExact(startSample,samples.size.toLong())
+  val rows=rowsBySource.getOrPut(source){JSONArray()}
+  rows.put(JSONObject().put("start_sample",startSample).put("end_sample",end)
+   .put("start_ms",startSample*1000/16000).put("end_ms",end*1000/16000).put("text","语音"))
+  val all=resolve(rows,source)
+  val row=all.getJSONObject(all.length()-1)
+  val voice=JSONObject().put("speaker",row.optJSONObject("voice_group_candidate")?:JSONObject().put("speaker_id",JSONObject.NULL))
+   .put("identity",row.optJSONObject("wearer_identity")?:JSONObject().put("status","uncertain"))
+   .put("display",row.optString("speaker_display","说话人未识别"))
+   .put("stable_speaker_id",row.opt("stable_speaker_id")?:JSONObject.NULL)
+   .put("source",source).put("start_sample",startSample).put("end_sample",end)
+   .put("single_speaker_status",row.optString("single_speaker_status","evidence_checked"))
+   .put("overlap_status",row.optString("overlap_status","evidence_checked"))
+   .put("speaker_identity_provenance",row.optJSONObject("speaker_identity_provenance")?:JSONObject.NULL)
+   .put("voice_gate","统一原始语音活动证据；无布尔绕过")
+  return Classification(voice,pure,unresolved)
  }
- override fun close(){try{matcher?.close()}finally{speaker.close()}}
+
+ /** Compatibility entry. The historical Boolean never bypasses acoustic analysis. */
+ @Suppress("UNUSED_PARAMETER")
+ fun classify(samples:FloatArray,singleSpeakerVerified:Boolean=false):JSONObject {
+  val start=legacyPosition
+  val result=classifyWithEvidence(samples,legacySource,start)
+  legacyPosition=Math.addExact(start,samples.size.toLong())
+  return result.voice
+ }
+ override fun close(){assignments.close()}
 }

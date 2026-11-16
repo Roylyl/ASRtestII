@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     [string]$JdkHome,
     [string]$BuildToolsDirectory,
@@ -13,7 +13,27 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$appDirectory = Join-Path $PSScriptRoot 'app'
+
+# Android's Windows resource compiler cannot reliably open non-ASCII source paths.
+# A directory junction gives the tools an ASCII path without moving or copying the project.
+$buildSourceRoot = $PSScriptRoot
+if ($buildSourceRoot -match '[^\x00-\x7F]') {
+    $taskBridge = Join-Path $env:LOCALAPPDATA 'RayNeoDev\ASRtestII-VoiceLearning-Source'
+    $taskActualRoot = [IO.Path]::GetFullPath($PSScriptRoot).TrimEnd('\')
+    if (Test-Path -LiteralPath $taskBridge) {
+        $taskLink = Get-Item -LiteralPath $taskBridge -Force
+        if ($taskLink.LinkType -ne 'Junction' -or [IO.Path]::GetFullPath([string]@($taskLink.Target)[0]).TrimEnd('\') -ne $taskActualRoot) {
+            throw "构建用目录链接已被其他工程占用：$taskBridge"
+        }
+    } else {
+        New-Item -ItemType Directory -Path (Split-Path $taskBridge -Parent) -Force | Out-Null
+        New-Item -ItemType Junction -Path $taskBridge -Target $taskActualRoot | Out-Null
+    }
+    $buildSourceRoot = $taskBridge
+    if (-not $PSBoundParameters.ContainsKey('Keystore')) { $Keystore = Join-Path $buildSourceRoot 'signing\v4-asr.p12' }
+}
+
+$appDirectory = Join-Path $buildSourceRoot 'app'
 $manifest = Join-Path $appDirectory 'AndroidManifest.xml'
 if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) { throw "源文件尚未就绪：$manifest" }
 if (-not $OutputApk) {
@@ -96,7 +116,7 @@ foreach ($file in @($AndroidJar, $aapt2, $d8, $apksigner, $zipalign)) {
     if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "构建组件缺失：$file" }
 }
 
-$buildDirectory = Join-Path $PSScriptRoot ('build\run-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
+$buildDirectory = Join-Path $buildSourceRoot ('build\run-' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
 $classesDirectory = Join-Path $buildDirectory 'classes'
 $dexDirectory = Join-Path $buildDirectory 'dex'
 $OutputApk = [IO.Path]::GetFullPath($OutputApk)
@@ -126,7 +146,7 @@ if (Test-Path -LiteralPath $lambdaStubs -PathType Leaf) {
     $bootClasspath += ';' + $lambdaStubs
 }
 if ($kotlinFiles.Count -gt 0) {
-    $compilerDirectory = Join-Path $PSScriptRoot 'tools\kotlin'
+    $compilerDirectory = Join-Path $buildSourceRoot 'tools\kotlin'
     $compilerJar = Join-Path $compilerDirectory 'kotlin-compiler-embeddable-2.1.0.jar'
     if (-not (Test-Path -LiteralPath $compilerJar -PathType Leaf)) {
         throw "缺少仓库随附的Kotlin编译器：$compilerJar"
@@ -147,7 +167,7 @@ if ($sourceFiles.Count -gt 0) {
     $quotedSources = @($sourceFiles | ForEach-Object { '"' + $_.FullName.Replace('\', '/') + '"' })
     [IO.File]::WriteAllLines($sourceList, [string[]]$quotedSources, [Text.UTF8Encoding]::new($false))
     Invoke-BuildCommand '编译Java源码' $javac @(
-        '-J-Duser.language=en', '-J-Duser.country=US',
+        '-J-Duser.language=en', '-J-Duser.country=US', '-J-Dfile.encoding=UTF-8',
         '-encoding', 'UTF-8', '-source', '8', '-target', '8', '-Xlint:-options',
         '-bootclasspath', $bootClasspath, '-classpath', $classpath,
         '-d', $classesDirectory, ('@' + $sourceList)
@@ -156,7 +176,7 @@ if ($sourceFiles.Count -gt 0) {
 
 $apkDirectory = Join-Path ([IO.Path]::GetTempPath()) ('ASRtestII-' + [Guid]::NewGuid().ToString('N'))
 $apkDirectory = [IO.Path]::GetFullPath($apkDirectory)
-if ($apkDirectory.StartsWith($PSScriptRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+if ($apkDirectory.StartsWith($buildSourceRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
     throw '系统临时目录位于源码仓库内，请将TEMP设为仓库外的目录后重试。'
 }
 New-Item -ItemType Directory -Path $apkDirectory | Out-Null
@@ -213,7 +233,7 @@ try {
                 ('assets/' + $relative), [IO.Compression.CompressionLevel]::NoCompression) | Out-Null
         }
         foreach ($notice in @('LICENSE', 'THIRD_PARTY_NOTICES.md')) {
-            [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, (Join-Path $PSScriptRoot $notice),
+            [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, (Join-Path $buildSourceRoot $notice),
                 ('assets/licenses/' + $notice), [IO.Compression.CompressionLevel]::Optimal) | Out-Null
         }
         $nativeDirectory = Join-Path $appDirectory 'jni\arm64-v8a'
@@ -231,7 +251,7 @@ try {
     $finalApk = $alignedApk
     if (-not $Unsigned) {
         $finalApk = Join-Path $apkDirectory 'signed.apk'
-        & (Join-Path $PSScriptRoot 'tools\Sign-Apk.ps1') -InputApk $alignedApk -OutputApk $finalApk -Java $java -Apksigner $apksigner -Keystore $Keystore -KeyAlias $KeyAlias
+        & (Join-Path $buildSourceRoot 'tools\Sign-Apk.ps1') -InputApk $alignedApk -OutputApk $finalApk -Java $java -Apksigner $apksigner -Keystore $Keystore -KeyAlias $KeyAlias
         Invoke-BuildCommand '验证APK签名' $java @('-jar', $apksigner, 'verify', '--verbose', $finalApk)
     }
 

@@ -6,7 +6,7 @@ import com.k2fsa.sherpa.onnx.SpeakerEmbeddingExtractorConfig
 import org.json.JSONObject
 import kotlin.math.sqrt
 
-/** Experimental online assignment, not diarization or verified identity. */
+/** Voice features plus evidence-gated task groups. A local activity ID never becomes an identity. */
 class LocalSpeakerTracker(assets: AssetManager, modelKey: String = SpeakerModels.CAM, private val groupingThreshold:Double = EXPERIMENTAL_THRESHOLD, private val decisionConfig:SpeakerDecisionConfig = SpeakerDecisionConfig()) {
  companion object {
   const val EXPERIMENTAL_THRESHOLD = SpeakerDefaults.NATIVE_SIMILARITY_PERCENT / 100.0
@@ -14,101 +14,82 @@ class LocalSpeakerTracker(assets: AssetManager, modelKey: String = SpeakerModels
   const val WEAK_CAM_MARGIN_THRESHOLD = 0.08
  }
  val modelName=SpeakerModels.name(modelKey)
- private val model=SpeakerModels.normalize(modelKey)
  init{require(groupingThreshold in 0.0..1.0){"声纹归组阈值需在0.00至1.00之间"}}
  private val extractor=SpeakerEmbeddingExtractor(assets,SpeakerEmbeddingExtractorConfig(model=SpeakerModels.asset(modelKey),numThreads=2,provider="cpu"))
- private val references=mutableListOf<FloatArray>()
- private val counts=mutableListOf<Int>()
+ private val groups=SpeakerEvidenceGroups(extractor.dim(),decisionConfig)
+ internal var evidenceObserver:((FloatArray,JSONObject)->Unit)?=null
  val dimension:Int get()=extractor.dim()
  fun embedding(samples:FloatArray):FloatArray? {
-  if(samples.size<16000) return null
-  val rms=sqrt(samples.sumOf{it.toDouble()*it}/samples.size);if(rms<0.003) return null
+  if(samples.size<16000||samples.any{!it.isFinite()})return null
+  val rms=sqrt(samples.sumOf{it.toDouble()*it}/samples.size);if(rms<0.003)return null
   val stream=extractor.createStream()
-  try {stream.acceptWaveform(samples,16000);stream.inputFinished();if(!extractor.isReady(stream))return null
+  try{
+   stream.acceptWaveform(samples,16000);stream.inputFinished();if(!extractor.isReady(stream))return null
    val vector=extractor.compute(stream);if(vector.isEmpty()||vector.any{!it.isFinite()})return null
    val norm=sqrt(vector.sumOf{it.toDouble()*it}.toFloat());if(norm<=1e-8f)return null
    return FloatArray(vector.size){vector[it]/norm}
-  } finally {stream.release()}
+  }finally{stream.release()}
  }
- fun reset(){references.clear();counts.clear()}
- fun snapshot():org.json.JSONArray {
-  val all=org.json.JSONArray()
-  for(i in references.indices){val values=org.json.JSONArray();references[i].forEach{values.put(it.toDouble())};all.put(org.json.JSONObject().put("count",counts[i]).put("embedding",values))}
-  return all
- }
- fun restore(saved:org.json.JSONArray){
-  require(saved.length()<=32){"声纹状态超过上限"}
-  val restored=mutableListOf<FloatArray>();val restoredCounts=mutableListOf<Int>()
-  for(i in 0 until saved.length()){
-   val obj=saved.getJSONObject(i);val count=obj.getInt("count");val a=obj.getJSONArray("embedding")
-   require(count>0&&a.length()==dimension){"声纹状态无效"}
-   val v=FloatArray(a.length()){a.getDouble(it).toFloat()};require(v.all{it.isFinite()}){"声纹状态非有限数值"}
-   val n=sqrt(v.sumOf{it.toDouble()*it}.toFloat());require(n>1e-8f){"声纹状态范数无效"}
-   restored.add(FloatArray(v.size){v[it]/n});restoredCounts.add(count)
+ fun reset()=groups.clear()
+ fun snapshot():org.json.JSONArray=groups.snapshot()
+ fun restore(saved:org.json.JSONArray)=groups.restore(saved)
+ fun resolvePending(pendingKey:String?):String?=groups.resolved(pendingKey)
+ /** Test observer sees the same three-second windows even when an enrolled identity takes precedence. */
+ internal fun traceRegisteredPure(candidate:SpeechEvidence.PureCandidate,identity:JSONObject,cachedVector:FloatArray?=null){
+  val observer=evidenceObserver?:return
+  val samples=candidate.samples();var at=0
+  while(samples.size-at>=3*16000){
+   val end=at+3*16000;val wave=samples.copyOfRange(at,end);val vector=if(at==0 && samples.size==3*16000) cachedVector?:embedding(wave) else embedding(wave)
+   if(vector!=null){
+    val startSample=candidate.startSample+at;val endSample=candidate.startSample+end
+    observer(vector.copyOf(),JSONObject().put("source",candidate.source).put("start_sample",startSample)
+     .put("end_sample",endSample).put("window_id",candidate.source+"@"+startSample+":"+endSample)
+     .put("sample_count",wave.size).put("audio_rms",sqrt(wave.sumOf{it.toDouble()*it}/wave.size))
+     .put("activity_evidence",candidate.evidenceJson()).put("identity",identity)
+     .put("decision","registered_identity_precedence").put("speaker_status","registered_identity_match"))
+   }
+   at=end
   }
-  references.clear();references.addAll(restored);counts.clear();counts.addAll(restoredCounts)
  }
- fun assign(samples:FloatArray):JSONObject {
-  val vector=embedding(samples)?:return JSONObject().put("speaker_id",JSONObject.NULL).put("speaker_status","insufficient_audio").put("threshold",groupingThreshold)
-  return assignEmbedding(vector,groupingThreshold)
- }
- /** Experimental matching with separate match, novelty and competing-speaker gates. */
- fun assignConservative(samples:FloatArray, rawVector:FloatArray?=null, singleSpeakerVerified:Boolean=false):JSONObject {
-  if(samples.size<16000||samples.any{!it.isFinite()})return JSONObject().put("speaker_id",JSONObject.NULL).put("speaker_status","insufficient_audio")
+ /** Caller passes an analyzer-owned pure interval. Quality filtering precedes this method. */
+ fun assignPure(candidate:SpeechEvidence.PureCandidate,rawVector:FloatArray?=null):JSONObject {
+  val samples=candidate.samples()
   val rms=sqrt(samples.sumOf{it.toDouble()*it}/samples.size)
-  val strong=samples.size>=32000&&rms>=0.003
-  var gain=1.0
-  val vector=if(rms>=0.003)rawVector?:embedding(samples) else {
-   val peak=samples.maxOf{kotlin.math.abs(it.toDouble())}
-   if(rms<=0||peak<=0)null else {
-    gain=minOf(6.0,0.006/rms,0.9/peak)
-    if(rms*gain<0.003)null else embedding(FloatArray(samples.size){(samples[it]*gain).toFloat()})
+  val clipped=samples.count{kotlin.math.abs(it)>=0.995f}.toDouble()/samples.size
+  if(samples.size<3*16000 || rms<0.003 || clipped>0.01)return JSONObject().put("speaker_id",JSONObject.NULL).put("speaker_status","low_quality_window")
+  var assigned=JSONObject().put("speaker_id",JSONObject.NULL).put("speaker_status","insufficient_audio")
+  var at=0
+  val supports=org.json.JSONArray()
+  while(samples.size-at>=3*16000){
+   val end=at+3*16000
+   val vector=if(at==0 && samples.size==3*16000)rawVector?:embedding(samples) else embedding(samples.copyOfRange(at,end))
+   if(vector!=null){
+    val startSample=candidate.startSample+at;val endSample=candidate.startSample+end
+    val support=SpeakerEvidenceGroups.Support(candidate.source,startSample,endSample,candidate.source+"@"+startSample+":"+endSample,
+     candidate.analysisWindowStart,candidate.analysisWindowEnd,candidate.localTrack)
+    assigned=groups.observe(vector,support)
+    val localRms=sqrt((at until end).sumOf{samples[it].toDouble()*samples[it]}/(end-at))
+    evidenceObserver?.invoke(vector.copyOf(),JSONObject(assigned.toString()).put("source",candidate.source)
+     .put("start_sample",startSample).put("end_sample",endSample).put("window_id",support.window)
+     .put("sample_count",end-at).put("audio_rms",localRms).put("activity_evidence",candidate.evidenceJson()))
+    supports.put(JSONObject(assigned.toString()))
    }
+   at=end
   }
-  val matchThreshold=if(strong)decisionConfig.strongMatch else decisionConfig.weakMatch
-  val out=JSONObject().put("speaker_id",JSONObject.NULL).put("speaker_status",if(strong)"speaker_undetermined" else "weak_candidate_rejected")
-   .put("threshold",matchThreshold).put("new_speaker_max_similarity",decisionConfig.newSpeakerMax).put("margin_threshold",decisionConfig.ambiguityMargin).put("threshold_status","experimental_uncalibrated")
-   .put("gain",gain).put("audio_rms",rms).put("candidate_kind",if(strong)"strong" else if(gain>1.0)"low_level" else "short_audio")
-   .put("single_speaker_status",if(singleSpeakerVerified)"predicted_single" else "not_verified").put("overlap_status",if(singleSpeakerVerified)"predicted_nonoverlap" else "not_checked")
-  if(vector==null)return out.put("speaker_status","insufficient_audio")
-  if(vector.size!=dimension||vector.any{!it.isFinite()})return out.put("speaker_status","invalid_embedding")
-  val scores=references.mapIndexed{i,r->i to r.indices.sumOf{(r[it]*vector[it]).toDouble()}}.sortedByDescending{it.second}
-  val best=scores.firstOrNull()
-  if(best==null){
-   if(!strong)return out.put("speaker_status","no_existing_group")
-   references.add(vector);counts.add(1)
-   return out.put("speaker_id","S1").put("speaker_status","experimental_segment_assignment").put("decision","initial_group").put("candidate_kind","strong")
-  }
-  val gap=if(scores.size>1)best.second-scores[1].second else null
-  out.put("similarity_to_previous",best.second).put("candidate_margin",gap?:JSONObject.NULL)
-   .put("best_existing_speaker_id","S${best.first+1}").put("existing_group_count",references.size)
-  if(best.second>=matchThreshold&&(gap==null||gap>=decisionConfig.ambiguityMargin)){
-   if(strong){
-    val count=counts[best.first];val old=references[best.first]
-    val mean=FloatArray(vector.size){(old[it]*count+vector[it])/(count+1)}
-    val n=sqrt(mean.sumOf{it.toDouble()*it}.toFloat())
-    if(n<=1e-8f)return out.put("speaker_status","invalid_embedding")
-    references[best.first]=FloatArray(mean.size){mean[it]/n};counts[best.first]=count+1
-   }
-   return out.put("speaker_id","S${best.first+1}").put("speaker_status",if(strong)"experimental_segment_assignment" else "weak_candidate").put("decision","match_existing").put("candidate_kind",if(strong)"strong" else out.getString("candidate_kind"))
-  }
-  if(strong&&best.second<decisionConfig.newSpeakerMax){
-   if(references.size>=32)return out.put("speaker_status","speaker_limit_reached")
-   references.add(vector);counts.add(1)
-   return out.put("speaker_id","S${references.size}").put("speaker_status","experimental_segment_assignment").put("decision","new_group").put("candidate_kind","strong")
-  }
-  if(gap!=null&&gap<decisionConfig.ambiguityMargin)out.put("speaker_status","ambiguous_multiple")
-  return out
+  return assigned.put("activity_evidence",candidate.evidenceJson()).put("audio_rms",rms).put("window_observations",supports)
  }
- // Exposed to the local evaluation probe to compare candidate thresholds without rerunning inference.
- fun assignEmbedding(vector:FloatArray, threshold:Double):JSONObject {
-  require(threshold>=0.0 && threshold<=1.0)
-  val scores=references.map { ref -> ref.indices.sumOf{(ref[it]*vector[it]).toDouble()} }
-  val idx=if(scores.isEmpty()) -1 else scores.indices.maxByOrNull{scores[it]}!!
-  // Exploratory threshold, uncalibrated for the device and acoustic conditions.
-  if(idx>=0 && scores[idx]<threshold && references.size>=32)return JSONObject().put("speaker_id",JSONObject.NULL).put("speaker_status","speaker_limit_reached").put("similarity_to_previous",scores[idx]).put("threshold",threshold)
-  val chosen=if(idx<0||scores[idx]<threshold){references.add(vector);counts.add(1);references.size-1}else{val count=counts[idx];val old=references[idx];val mean=FloatArray(vector.size){(old[it]*count+vector[it])/(count+1)};val n=sqrt(mean.sumOf{it.toDouble()*it}.toFloat());references[idx]=FloatArray(mean.size){mean[it]/n};counts[idx]=count+1;idx}
-  return JSONObject().put("speaker_id","S${chosen+1}").put("speaker_status","experimental_segment_assignment").put("similarity_to_previous",if(idx<0)JSONObject.NULL else scores[idx]).put("threshold",threshold)
+ /** Compatibility path: a Boolean never grants permission to create/update a voice group. */
+ fun assignConservative(samples:FloatArray,rawVector:FloatArray?=null,singleSpeakerVerified:Boolean=false):JSONObject {
+  val vector=rawVector?:embedding(samples)
+   ?:return JSONObject().put("speaker_id",JSONObject.NULL).put("speaker_status","insufficient_audio")
+  return groups.nearest(vector).put("single_speaker_status","raw_activity_evidence_required")
+   .put("legacy_single_speaker_claim",singleSpeakerVerified).put("threshold",decisionConfig.strongMatch)
+ }
+ fun assign(samples:FloatArray):JSONObject=assignConservative(samples)
+ /** Explicit developer replay only. Production audio uses assignPure with raw activity evidence. */
+ fun assignEmbedding(vector:FloatArray,threshold:Double):JSONObject {
+  require(threshold in 0.0..1.0)
+  return groups.probeAssign(vector,threshold)
  }
  fun close(){extractor.release()}
 }

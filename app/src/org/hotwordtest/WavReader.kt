@@ -44,6 +44,15 @@ object WavReader {
         var blockAlign = 0
         var result: FloatArray? = null
         while (consumed < riffEnd) {
+            // Some PCM recordings overstate RIFF size. Only accept real EOF at
+            // a fully parsed chunk boundary after a complete nonempty data chunk.
+            // Remaining bytes must still form complete chunks and padding.
+            if (result != null) {
+                source.mark(1)
+                val next = source.read()
+                if (next < 0) break
+                source.reset()
+            }
             require(riffEnd - consumed >= 8) { "WAV数据块头不完整" }
             val id = tag()
             val length = u32()

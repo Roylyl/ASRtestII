@@ -20,7 +20,7 @@ import kotlin.math.roundToInt
 object TimeAlignedAsr {
  private const val RATE=16000
  private data class Span(val start:Int,val end:Int,val speaker:Int)
- private data class Turn(val start:Int,var end:Int,val speakers:List<Int>,var inVad:Boolean,var inDiarization:Boolean)
+ private data class Turn(val start:Int,var end:Int,var speakers:List<Int>,var inVad:Boolean,var inDiarization:Boolean,var mergedSameIdentity:Boolean=false)
 
  interface Progress {
   fun onVad(index:Int,text:String)
@@ -55,10 +55,17 @@ object TimeAlignedAsr {
    val fromVad=speech.any{it.first<end&&it.second>start}
    val ids=speakers.filter{it.start<end&&it.end>start}.map{it.speaker}.distinct().sorted()
    if(!fromVad&&ids.isEmpty())continue
-   val last=turns.lastOrNull()
-   if(last!=null&&last.end==start&&last.speakers==ids){
-    last.end=end;last.inVad=last.inVad||fromVad;last.inDiarization=last.inDiarization||ids.isNotEmpty()
-   }else turns.add(Turn(start,end,ids,fromVad,ids.isNotEmpty()))
+   var at=start
+   while(at<end){
+    val last=turns.lastOrNull()
+    if(last!=null&&last.end==at&&last.speakers==ids&&last.end-last.start<20*RATE){
+     val next=minOf(end,last.start+20*RATE)
+     last.end=next;last.inVad=last.inVad||fromVad;last.inDiarization=last.inDiarization||ids.isNotEmpty();at=next
+    }else{
+     val next=minOf(end,at+20*RATE)
+     turns.add(Turn(at,next,ids,fromVad,ids.isNotEmpty()));at=next
+    }
+   }
   }
   return turns
  }
@@ -104,11 +111,12 @@ object TimeAlignedAsr {
  }
 
  /** Reuse the ASR and speaker models for a sequence of files. Not thread-safe. */
- class Session(private val assets:AssetManager,modelDir:File,private val speakerKey:String,
+ class Session @JvmOverloads constructor(private val assets:AssetManager,modelDir:File,private val speakerKey:String,
                private val hotwords:String="",private val vadKey:String=VadModelFactory.SILERO,
                private val lazyDiarization:Boolean=false,private val context:Context?=null,
                private val speakerThreshold:Double=LocalSpeakerTracker.EXPERIMENTAL_THRESHOLD,
-               private val decisionConfig:SpeakerDecisionConfig=SpeakerDecisionConfig()):AutoCloseable {
+               private val decisionConfig:SpeakerDecisionConfig=SpeakerDecisionConfig(),
+               private val evidenceObserver:((FloatArray,JSONObject)->Unit)?=null):AutoCloseable {
   private val t0=SystemClock.elapsedRealtimeNanos()
   private val withHotwords=hotwords.isNotEmpty()
   private val recognizer=OnlineRecognizer(config=OnlineRecognizerConfig(
@@ -121,56 +129,42 @@ object TimeAlignedAsr {
     modelingUnit=if(withHotwords)"bpe" else "",bpeVocab=if(withHotwords)File(modelDir,"bpe.vocab").path else ""),
    enableEndpoint=false,decodingMethod=if(withHotwords)"modified_beam_search" else "greedy_search",maxActivePaths=4,hotwordsScore=4f))
   val asrInitMs=(SystemClock.elapsedRealtimeNanos()-t0)/1000000.0
-  private var diarizer:DiarizationTest.Session?=if(lazyDiarization)null else
-   try { DiarizationTest.Session(assets,speakerKey,-1,speakerThreshold) }
-   catch(e:Throwable){recognizer.release();throw e}
+  private var diarizer:DiarizationTest.Session?=null
   private fun getDiarizer():DiarizationTest.Session {
    val existing=diarizer;if(existing!=null)return existing
    return DiarizationTest.Session(assets,speakerKey,-1,speakerThreshold).also{diarizer=it}
   }
 
-  private var sharedVoiceGroups:LocalSpeakerTracker?=null
-  private fun voiceGroups():LocalSpeakerTracker? {
+  private var assignments:StableSpeakerAssignments?=null
+  private var learningCandidates:List<SpeechEvidence.PureCandidate> = emptyList()
+  private var unresolvedLearningCandidates:List<SpeechEvidence.PureCandidate> = emptyList()
+  private fun registry():StableSpeakerAssignments? {
    if(context==null)return null
-   return sharedVoiceGroups?:LocalSpeakerTracker(assets,speakerKey,speakerThreshold,decisionConfig).also{sharedVoiceGroups=it}
+   return assignments?:StableSpeakerAssignments(assets,context,speakerKey,decisionConfig,evidenceObserver).also{assignments=it}
   }
-  // Acoustic groups span a batch. Recency and diarizer IDs only apply within one WAV.
-  private inner class FileTurnLabels {
-   private var lastLocalId:Int?=null
-   private var lastGroup:String?=null
-   private var lastMatchedEnd=0
-   fun label(entry:JSONObject,turn:Turn):String {
-    val localId=turn.speakers.singleOrNull()
-    if(localId==null){
-     lastLocalId=null
-     return if(turn.speakers.isEmpty())"说话人未识别" else "多人重叠"
-    }
-    if(localId!=lastLocalId)lastGroup=null
-    lastLocalId=localId
-    val voice=entry.optJSONObject("voice_group_candidate")
-    var id=voice?.takeUnless{it.isNull("speaker_id")}?.getString("speaker_id")
-    if(id!=null){
-     lastGroup=id
-     lastMatchedEnd=turn.end
-    }else if(lastGroup!=null && turn.end-turn.start<RATE*3/2 && turn.start-lastMatchedEnd in 0..RATE*3){
-     val canExtend=when(voice?.optString("speaker_status")){
-      "insufficient_audio"->true
-      "weak_candidate_rejected"->voice.optString("best_existing_speaker_id")==lastGroup &&
-       voice.optInt("existing_group_count")==1 &&
-       voice.optDouble("similarity_to_previous",-1.0)>=decisionConfig.weakMatch-decisionConfig.ambiguityMargin
-      else->false
-     }
-     if(canExtend){
-      id=lastGroup
-      entry.put("speaker_continuity",JSONObject().put("method","short_nearby_same_diarizer_track").put("speaker_id",id))
-     }
-    }
-    val identity=entry.optJSONObject("wearer_identity")
-    if(identity?.optString("status")=="wearer_candidate"&&!identity.isNull("display_name")){
-     identity.optString("display_name").takeIf{it.isNotBlank()}?.let{return it}
-    }
-    return id?.let(SpeakerTranscript::groupName)?:"说话人未识别"
+  val pureCandidatesLastRun:List<SpeechEvidence.PureCandidate> get()=learningCandidates.toList()
+  fun takeLearningCandidates():List<SpeechEvidence.PureCandidate> =
+   learningCandidates.also{learningCandidates=emptyList()}
+  fun takeUnresolvedLearningCandidates():List<SpeechEvidence.PureCandidate> =
+   unresolvedLearningCandidates.also{unresolvedLearningCandidates=emptyList()}
+
+  private fun activityDiarization(evidence:JSONObject,sampleCount:Int):JSONObject {
+   val tracks=linkedMapOf<String,Int>();val segments=JSONArray()
+   // Never collapse simultaneous local tracks, including when they match the same profile.
+   val refined=evidence.optJSONArray("refined_activities")
+   val activity=refined?:SpeechEvidence.displayActivities(evidence)
+   for(i in 0 until activity.length()){
+    val row=activity.getJSONObject(i)
+    val track=row.getString("local_track")
+    val identity=if(refined!=null&&!row.isNull("stable_speaker_id"))row.optString("stable_speaker_id","") else ""
+    val key=if(refined!=null)track+"\u0000"+identity else track
+    segments.put(JSONObject().put("start_seconds",row.getLong("start_sample")/16000.0)
+     .put("end_seconds",row.getLong("end_sample")/16000.0)
+     .put("speaker_id",tracks.getOrPut(key){tracks.size}))
    }
+   return JSONObject().put("status","completed").put("sample_rate",RATE).put("audio_seconds",sampleCount/16000.0)
+    .put("segments",segments).put("processing_mode","raw_unsmoothed_window_activity")
+    .put("local_tracks_are_people",false).put("process_ms",0.0).put("model_init_ms",0.0)
   }
 
   private fun transcribeTurn(samples:FloatArray,turn:Turn,cancelled:()->Boolean):JSONObject {
@@ -198,90 +192,100 @@ object TimeAlignedAsr {
    return JSONObject().put("start_sample",turn.start).put("end_sample",turn.end)
     .put("start_ms",turn.start*1000L/RATE).put("end_ms",turn.end*1000L/RATE)
     .put("text",text).put("speaker_candidates",ids).put("speaker_id",JSONObject.NULL)
-    .put("association_status",when(turn.speakers.size){0->"no_speaker_match";1->"single_candidate_unverified";else->"multiple_candidates_ambiguous"})
+    .put("association_status",if(turn.mergedSameIdentity&&turn.speakers.size>1)"sequential_tracks_same_identity" else when(turn.speakers.size){0->"no_speaker_match";1->"single_candidate_unverified";else->"multiple_candidates_ambiguous"})
     .put("recognition_status",if(text.isBlank())"empty" else "completed")
     .put("short_interval",turn.end-turn.start<RATE/5).put("coverage_sources",coverage)
     .put("time_source","输入音频样本偏移，边界由VAD和说话人切分预测，非词级时间")
     .put("text_source","对该音频区间独立运行X-ASR；短片段和边界可能漏字")
   }
 
-  fun process(samples:FloatArray,cancelled:()->Boolean={false},
-              cachedDiarization:JSONObject?=null,cachedSourceGroup:String?=null,progress:Progress?=null):JSONObject {
+  @JvmOverloads fun process(samples:FloatArray,cancelled:()->Boolean={false},
+              cachedDiarization:JSONObject?=null,cachedSourceGroup:String?=null,progress:Progress?=null,
+              source:String="file:"+java.util.UUID.randomUUID().toString()):JSONObject {
+   learningCandidates=emptyList();unresolvedLearningCandidates=emptyList()
    if(cancelled())throw InterruptedException("已停止")
    val fileStart=SystemClock.elapsedRealtimeNanos()
    val asrStart=SystemClock.elapsedRealtimeNanos()
    progress?.onVad(0,"")
-   val asr=VadFilePipeline(assets,vadKey).process(samples,recognizer,hotwords,cancelled=cancelled,
-    onPartial={i,_,_,text->progress?.onVad(i+1,text)},onFinal={seg->progress?.onVad(seg.index+1,seg.text)})
+   val asr=VadFilePipeline(assets,vadKey).detect(samples,cancelled=cancelled,
+    onFinal={seg->progress?.onVad(seg.index+1,"")})
    val asrEnd=SystemClock.elapsedRealtimeNanos()
    if(cancelled())throw InterruptedException("已停止")
    require(cachedDiarization==null || !cachedSourceGroup.isNullOrEmpty()){"缓存来源未指定"}
    progress?.onDiarization(0,0)
-   val diarization=if(cachedDiarization==null)getDiarizer().process(samples,progress?.let{it::onDiarization})
+   val stable=registry()
+   learningCandidates=if(stable!=null)stable.observe(samples,source) else emptyList()
+   unresolvedLearningCandidates=stable?.takeUnresolvedLearningCandidates(source).orEmpty()
+   val activity=stable?.activityEvidence(source)
+   val diarization=if(activity!=null)activityDiarization(activity,samples.size)
+    else if(cachedDiarization==null)getDiarizer().process(samples,progress?.let{it::onDiarization})
     else JSONObject(cachedDiarization.toString())
    if(cancelled())throw InterruptedException("已停止")
-   val out=align(asr,diarization)
+   val out=align(asr,diarization).put("vad_transcript_status","not_decoded")
+   if(activity!=null)out.put("raw_speech_activity",activity)
    val turnsStarted=SystemClock.elapsedRealtimeNanos()
-   val turns=JSONArray()
-   val intervals=speakerTurns(asr,diarization)
-   progress?.onTurn(0,intervals.size,null)
-   // The diarizer indicates possible overlap; only one-candidate intervals may receive
-   // an experimental voice comparison. Failure does not discard the original ASR.
-   val matcher=if(context==null)null else try{WearerVoiceStore.Matcher(context,speakerKey)}catch(_:Exception){null}
-   // Independent from pyannote speaker IDs; disabled for batch/probe callers without a UI context.
-   val fileLabels=FileTurnLabels()
-   val voiceGroups=try{voiceGroups()}catch(e:Exception){Log.w("HotwordTest","无法初始化声纹归组",e);null}
-   try {
-    for(turn in intervals){
-     val entry=transcribeTurn(samples,turn,cancelled)
-     if(turn.speakers.size==1 && voiceGroups!=null){
-      val group=if(entry.optString("text").isBlank()){
-       JSONObject().put("speaker_id",JSONObject.NULL).put("speaker_status","empty_asr_not_grouped")
-      }else try{voiceGroups.assignConservative(samples.copyOfRange(turn.start,turn.end),singleSpeakerVerified=true)}catch(_:Exception){JSONObject().put("speaker_id",JSONObject.NULL).put("speaker_status","comparison_failed")}
-      entry.put("voice_group_candidate",group)
-     }
-     if(matcher!=null) {
-      val identity=try { matcher.identify(samples.copyOfRange(turn.start,turn.end),turn.speakers.size==1) }
-       catch(_:Exception){JSONObject().put("status","comparison_failed")}
-      entry.put("wearer_identity",identity)
-     }
-     if(context!=null)entry.put("speaker_display",fileLabels.label(entry,turn))
-     turns.put(entry)
-     progress?.onTurn(turns.length(),intervals.size,entry)
+   var turns=JSONArray()
+   val initialIntervals=speakerTurns(asr,diarization)
+   // Merge adjacent single-track spans only when both independently resolve to the same ID.
+   // Unknown or overlapping spans remain boundaries, and no unaccounted audio is inserted.
+   val intervals=if(stable==null)initialIntervals else {
+    val probes=JSONArray().apply{initialIntervals.forEach{put(JSONObject().put("start_sample",it.start).put("end_sample",it.end))}}
+    val resolved=stable.resolve(probes,source,final=true)
+    val merged=mutableListOf<Turn>();var previousId:String?=null;var previousSingle=false
+    for(i in initialIntervals.indices){
+     val turn=initialIntervals[i];val row=resolved.getJSONObject(i)
+     val id=if(row.has("stable_speaker_id")&&!row.isNull("stable_speaker_id"))row.optString("stable_speaker_id","").takeIf{it.isNotBlank()} else null
+     val single=turn.speakers.size==1&&turn.inDiarization
+     val last=merged.lastOrNull()
+     if(last!=null&&last.end==turn.start&&single&&previousSingle&&id!=null&&id==previousId&&turn.end-last.start<=20*RATE){
+      last.end=turn.end;last.inVad=last.inVad||turn.inVad;last.inDiarization=true
+      last.speakers=(last.speakers+turn.speakers).distinct().sorted();last.mergedSameIdentity=true
+     }else merged.add(turn.copy())
+     previousId=id;previousSingle=single
     }
-   } finally {matcher?.close()}
-   if(voiceGroups!=null){
-    progress?.onGrouping()
-    out.put("offline_voice_grouping",JSONObject().put("method","threshold_gated_cross_clip_embedding_v2")
-     .put("new_speaker_max_similarity",decisionConfig.newSpeakerMax).put("strong_match",decisionConfig.strongMatch)
-     .put("weak_match",decisionConfig.weakMatch).put("raw_window_ids_used_for_identity",false))
+    merged
    }
+   progress?.onTurn(0,intervals.size,null)
+   for(turn in intervals){
+    val entry=transcribeTurn(samples,turn,cancelled)
+    turns.put(entry)
+    val preview=if(stable!=null)stable.resolve(JSONArray().put(entry),source).getJSONObject(0)
+      else JSONObject(entry.toString()).put("speaker_display",if(turn.speakers.size>1)"多人重叠" else "说话人未识别")
+    progress?.onTurn(turns.length(),intervals.size,preview)
+   }
+   progress?.onGrouping()
+   if(stable!=null)turns=stable.resolve(turns,source,final=true)
+   out.put("offline_voice_grouping",JSONObject().put("method","independent_raw_activity_windows_v3")
+    .put("minimum_new_speaker_windows",2).put("minimum_new_speaker_samples",6*RATE)
+    .put("new_speaker_max_similarity",decisionConfig.newSpeakerMax).put("strong_match",decisionConfig.strongMatch)
+    .put("raw_window_ids_used_for_identity",false))
    val turnsEnded=SystemClock.elapsedRealtimeNanos()
    out.put("speaker_turn_transcripts",turns)
     .put("speaker_turn_alignment_status","speaker_activity_intervals_independent_asr")
-    .put("speaker_turn_note","按VAD与说话人活动的并集切分音频并独立转写；仅为模型预测，重叠及短片段可能丢字，原VAD转写保留在asr_segments")
-    .put("voice_group_candidate_scope","同一任务内跨文件按声纹归组。只有足够清晰且与已有声纹差异足够大的单人语音才能新建分组，重叠片段不创建人物。")
+    .put("speaker_turn_note","按VAD与说话人活动的并集切分音频并独立转写；仅为模型预测，重叠及短片段可能丢字；asr_segments仅记录VAD时间")
+    .put("voice_group_candidate_scope","同一任务内跨文件按声纹归组。新人物需至少2个独立纯净窗口累计6秒支持；短回答只有前后确认同人且原始活动不冲突时才回填。")
     .put("speaker_turn_process_ms",(turnsEnded-turnsStarted)/1000000.0)
-   if(voiceGroups!=null){
+   if(stable!=null){
     out.put("speaker_identity_status","task_scoped_voice_group_and_enrollment_predictions")
     out.put("offline_voice_recluster",JSONObject().put("status","skipped").put("reason","threshold_gated_session_grouping_authoritative"))
    }
-   out.put("diarization_source",if(cachedDiarization==null)"computed" else "reused")
+   out.put("diarization_source",if(activity!=null)"raw_activity_computed" else if(cachedDiarization==null)"computed" else "reused")
     .put("diarization_cache_source_group",cachedSourceGroup?:JSONObject.NULL)
     .put("diarization_prior_process_ms",if(cachedDiarization==null)JSONObject.NULL else diarization.getDouble("process_ms"))
     .put("diarization_timing_note",if(cachedDiarization==null)"本次切分耗时" else "diarization.process_ms为来源任务先前耗时，不是本次耗时")
    out.put("vad_model",VadModelFactory.name(vadKey)).put("asr_model","X-ASR1920ms")
     .put("decoding",if(withHotwords)"modified_beam_search" else "greedy_search")
-    .put("asr_model_init_ms",asrInitMs).put("diarization_model_init_ms",if(cachedDiarization==null)diarizer!!.initMs else JSONObject.NULL)
+    .put("asr_model_init_ms",asrInitMs).put("diarization_model_init_ms",if(activity!=null)0.0 else if(cachedDiarization==null)diarizer!!.initMs else JSONObject.NULL)
     .put("vad_asr_process_ms",(asrEnd-asrStart)/1000000.0)
     .put("total_ms",(SystemClock.elapsedRealtimeNanos()-fileStart)/1000000.0)
     .put("timing_note",if(cachedDiarization==null)
      "文件处理按顺序执行；total_ms包含说话人切分和逐片段转写，不含复用的模型初始化；非实时延迟"
-     else "total_ms为本次VAD、转写和逐片段转写耗时，不含来源任务的说话人切分；非完整链路耗时或实时延迟")
+     else "total_ms为本次VAD和逐片段转写耗时，不含来源任务的说话人切分；非完整链路耗时或实时延迟")
    return out
   }
   override fun close(){
-   try{sharedVoiceGroups?.close()}finally{try{diarizer?.close()}finally{recognizer.release()}}
+   learningCandidates=emptyList();unresolvedLearningCandidates=emptyList()
+   try{assignments?.close()}finally{try{diarizer?.close()}finally{recognizer.release()}}
   }
  }
  fun process(assets:AssetManager,samples:FloatArray,modelDir:File,speakerKey:String,

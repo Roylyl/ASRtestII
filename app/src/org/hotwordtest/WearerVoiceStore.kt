@@ -90,8 +90,16 @@ object WearerVoiceStore {
   return out
  }
 
- @Synchronized fun listProfiles(context:Context):List<ProfileInfo> =
-  allProfiles(context).map{ProfileInfo(it.id,it.model,it.displayName,it.embeddings.keys.toSet())}
+ fun listProfiles(context:Context):List<ProfileInfo> {
+  val profiles=synchronized(this){allProfiles(context)}
+  val learnedModels=VoiceLearningStore.modelSupport(context)
+  return profiles.map{
+   ProfileInfo(it.id,it.model,it.displayName,it.embeddings.keys.toSet()+learnedModels[it.id].orEmpty())
+  }
+ }
+ @Synchronized internal fun hasProfile(context:Context,id:String)=readFile(profileFile(context,id),id)!=null
+ @Synchronized fun hasInitialTemplate(context:Context,id:String,modelKey:String):Boolean =
+  readFile(profileFile(context,id),id)?.embeddings?.containsKey(SpeakerModels.normalize(modelKey))==true
 
  @Synchronized fun renameById(context:Context,id:String,name:String):ProfileInfo {
   val clean=validName(name);val path=profileFile(context,id)
@@ -101,20 +109,37 @@ object WearerVoiceStore {
   return ProfileInfo(id,existing.model,clean,existing.embeddings.keys.toSet())
  }
 
- @Synchronized fun deleteById(context:Context,id:String){
+ fun deleteById(context:Context,id:String){
+  // Validate the ID before a durable deletion marker is written.
   val path=profileFile(context,id)
-  require(path.exists() || File(path.path+".bak").exists()){ "声纹不存在" }
-  AtomicFile(path).delete()
-  require(!path.exists() && !File(path.path+".bak").exists()){ "声纹删除失败" }
+  VoiceLearningEvaluation.deleteProfileAndCases(context,id){
+   VoiceLearningStore.deleteProfile(context,id){
+    synchronized(this){
+      // Other profiles may retain historical matching diagnostics that mention this ID.
+      // Keep their names and embeddings intact; only scrub structured diagnostics. The
+      // enclosing durable deletion marker makes every atomic write safe to retry.
+      for(other in allProfiles(context))if(other.id!=id){
+       val otherPath=profileFile(context,other.id)
+       val json=JSONObject(AtomicFile(otherPath).openRead().bufferedReader(Charsets.UTF_8).use{it.readText()})
+       var changed=false
+       for(field in listOf("continuity","supplement_continuity","supplement_identity_verification"))
+        if(VoiceIdentityRedaction.diagnostic(json.opt(field),id))changed=true
+       if(changed)writeFile(otherPath,json)
+      }
+     AtomicFile(path).delete()
+     require(!path.exists() && !File(path.path+".bak").exists()){ "声纹删除失败，请重试" }
+    }
+   }
+  }
  }
 
  fun profileName(context:Context,modelKey:String):String? {
-  return try{val model=SpeakerModels.normalize(modelKey);synchronized(this){allProfiles(context).firstOrNull{it.embeddings.containsKey(model)}?.displayName}}
+  return try{val model=SpeakerModels.normalize(modelKey);listProfiles(context).firstOrNull{model in it.models}?.name}
    catch(_:Exception){null}
  }
 
  /** Rename without extracting or changing the stored embedding. */
- fun rename(context:Context,modelKey:String,name:String):String {
+ @Synchronized fun rename(context:Context,modelKey:String,name:String):String {
   val model=SpeakerModels.normalize(modelKey);val clean=validName(name)
   require(read(context,model)?.embeddings?.containsKey(model)==true){"当前模型尚未登记声纹"}
   val atomic=AtomicFile(file(context,model))
@@ -127,38 +152,24 @@ object WearerVoiceStore {
  fun status(context:Context,modelKey:String):String {
   return try {
    val model=SpeakerModels.normalize(modelKey)
-   val profiles=synchronized(this){allProfiles(context)}
-   if(profiles.any{it.embeddings.containsKey(model)}) "已登记"
+   val profiles=listProfiles(context)
+   if(profiles.any{model in it.models}) "已登记"
    else if(profiles.isNotEmpty()) "已登记其他模型，请补录" else "未登记"
   } catch(_:Exception){"声纹数据不可用，请重新登记"}
  }
 
  /** Runs on a worker thread. VAD is a speech filter, not a single-speaker guarantee. */
- private fun extractSpeech(context:Context,samples:FloatArray):FloatArray {
-  require(samples.size<=MAX_SAMPLES){"录音不能超过30秒"}
-  require(samples.size>=MIN_SPEECH_SAMPLES){"录音太短，请重新录制至少3秒有效语音"}
-  require(samples.all{it.isFinite()}){"录音数据无效，请重新录制"}
-  val vad=VadModelFactory.create(context.assets,VadModelFactory.SILERO)
-  val pieces=mutableListOf<FloatArray>();var speechCount=0
-  fun drain(){while(!vad.empty()){
-   val segment=vad.front();val keep=segment.samples.copyOf();vad.pop()
-   if(keep.isNotEmpty()){pieces.add(keep);speechCount+=keep.size}
-  }}
-  try{
-   val window=VadModelFactory.windowSize(VadModelFactory.SILERO);var pos=0;var speechStart=-1
-   while(pos<samples.size){val n=minOf(window,samples.size-pos);val frame=FloatArray(window)
-    samples.copyInto(frame,0,pos,pos+n);vad.acceptWaveform(frame);pos+=n;drain()
-    if(vad.isSpeechDetected()){
-     if(speechStart<0)speechStart=pos-n
-     if(pos-speechStart>=20*RATE){vad.flush();drain();speechStart=pos}
-    }else speechStart=-1
-   }
-   vad.flush();drain()
-  } finally {vad.release()}
-  require(speechCount>=MIN_SPEECH_SAMPLES){"检测到的语音不足3秒，请在安静环境重新朗读"}
-  val speech=FloatArray(speechCount);var offset=0
-  for(piece in pieces){piece.copyInto(speech,offset);offset+=piece.size}
-  return speech
+ private data class EnrollmentSpeech(val wave:FloatArray,val continuity:JSONObject)
+ private fun extractSpeech(context:Context,samples:FloatArray):EnrollmentSpeech {
+  require(samples.size in MIN_SPEECH_SAMPLES..MAX_SAMPLES){"请录制3～30秒有效语音"}
+  val evidence=SpeechEvidence.analyze(context,samples,"enrollment:"+UUID.randomUUID(),0L,false)
+  val candidates=SpeechEvidence.extractPureCandidates(samples,evidence).sortedByDescending{it.endSample-it.startSample}
+  var reason="未找到至少3秒连续、避开重叠的清晰人声，请在安静环境重新录制"
+  for(candidate in candidates){
+   val assessment=VoiceLearningStore.assess(context,candidate);reason=assessment.reason
+   assessment.admission?.let{return EnrollmentSpeech(checkNotNull(it.quality.speech),it.gate.evidence)}
+  }
+  throw IllegalArgumentException(reason)
  }
  private fun extractVector(context:Context,model:String,speech:FloatArray):JSONArray {
   val tracker=LocalSpeakerTracker(context.assets,model)
@@ -170,70 +181,131 @@ object WearerVoiceStore {
  private fun prepareEnrollment(context:Context,modelKey:String,samples:FloatArray,name:String):Pair<String,JSONObject> {
   val cleanName=validName(name)
   val model=SpeakerModels.normalize(modelKey)
-  val speech=extractSpeech(context,samples)
+  val selected=extractSpeech(context,samples);val speech=selected.wave
   val values=extractVector(context,model,speech)
   val json=JSONObject().put("version",1).put("model",model).put("sample_rate",RATE).put("display_name",cleanName)
-   .put("embedding",values).put("speech_seconds",speech.size.toDouble()/RATE)
+   .put("embedding",values).put("speech_seconds",speech.size.toDouble()/RATE).put("continuity",selected.continuity)
   return model to json
  }
  fun enroll(context:Context,modelKey:String,samples:FloatArray,name:String=DEFAULT_NAME):String {
-  val (model,json)=prepareEnrollment(context,modelKey,samples,name)
-  synchronized(this){writeFile(file(context,model),json)}
-  return "声纹已登记，使用${SpeakerModels.name(model)}。识别结果为实验性判断。"
+  return VoiceLearningStore.guardedNewProfile(context,{frozen->prepareEnrollment(frozen,modelKey,samples,name)}){prepared->
+   val (model,json)=prepared;writeFile(file(context,model),json)
+   "声纹已登记，使用${SpeakerModels.name(model)}。识别结果为实验性判断。"
+  }
  }
 
  fun enrollNew(context:Context,modelKey:String,samples:FloatArray,name:String):ProfileInfo {
-  val (model,json)=prepareEnrollment(context,modelKey,samples,name)
-  val id=UUID.randomUUID().toString()
-  synchronized(this){writeFile(profileFile(context,id),json)}
-  return ProfileInfo(id,model,json.getString("display_name"))
+  return VoiceLearningStore.guardedNewProfile(context,{frozen->prepareEnrollment(frozen,modelKey,samples,name)}){prepared->
+   val (model,json)=prepared;val id=UUID.randomUUID().toString();writeFile(profileFile(context,id),json)
+   ProfileInfo(id,model,json.getString("display_name"))
+  }
  }
  /** Both embeddings are computed before creating a profile; raw samples never leave memory. */
  fun enrollBoth(context:Context,samples:FloatArray,name:String):ProfileInfo {
-  val cleanName=validName(name);val speech=extractSpeech(context,samples)
-  val vectors=JSONObject()
-  for(model in listOf(SpeakerModels.CAM,SpeakerModels.ERES)) {
-   try{vectors.put(model,extractVector(context,model,speech))}
-   catch(e:Exception){throw IllegalStateException("${SpeakerModels.name(model)}声纹提取失败，未保存：${e.message?:"请重试"}",e)}
-  }
-  val id=UUID.randomUUID().toString()
-  val json=JSONObject().put("version",2).put("sample_rate",RATE).put("display_name",cleanName)
-   .put("embeddings",vectors).put("speech_seconds",speech.size.toDouble()/RATE)
-  synchronized(this){writeFile(profileFile(context,id),json)}
-  return ProfileInfo(id,SpeakerModels.CAM,cleanName,setOf(SpeakerModels.CAM,SpeakerModels.ERES))
- }
- /** Re-recording fills only missing models, preserving stored embeddings and current name. */
- fun supplementBothById(context:Context,id:String,samples:FloatArray):ProfileInfo {
-  val path=profileFile(context,id)
-  val original=synchronized(this){readFile(path,id)?:throw IllegalArgumentException("声纹不存在")}
-  val missing=listOf(SpeakerModels.CAM,SpeakerModels.ERES).filter{!original.embeddings.containsKey(it)}
-  if(missing.isEmpty())return ProfileInfo(id,original.model,original.displayName,original.embeddings.keys.toSet())
-  val speech=extractSpeech(context,samples)
-  val computed=JSONObject()
-  for(model in missing) {
-   try{computed.put(model,extractVector(context,model,speech))}
-   catch(e:Exception){throw IllegalStateException("${SpeakerModels.name(model)}声纹提取失败，原声纹未改变：${e.message?:"请重试"}",e)}
-  }
-  return synchronized(this){
-   val current=readFile(path,id)?:throw IllegalArgumentException("声纹已删除，未保存补录")
-   val json=JSONObject(AtomicFile(path).openRead().bufferedReader(Charsets.UTF_8).use{it.readText()})
-   val embeddings=if(json.getInt("version")==1)
-    JSONObject().put(json.getString("model"),json.getJSONArray("embedding")) else json.getJSONObject("embeddings")
-   for(model in missing)if(!embeddings.has(model))embeddings.put(model,computed.getJSONArray(model))
-   json.put("version",2).put("embeddings",embeddings).remove("embedding");json.remove("model")
-   json.put("supplement_speech_seconds",speech.size.toDouble()/RATE)
-   writeFile(path,json)
-   ProfileInfo(id,current.model,current.displayName,listOf(SpeakerModels.CAM,SpeakerModels.ERES).filter{embeddings.has(it)}.toSet())
+  return VoiceLearningStore.guardedNewProfile(context,{frozen->
+   val cleanName=validName(name);val selected=extractSpeech(frozen,samples);val speech=selected.wave
+   val vectors=JSONObject()
+   for(model in listOf(SpeakerModels.CAM,SpeakerModels.ERES)) {
+    try{vectors.put(model,extractVector(frozen,model,speech))}
+    catch(e:Exception){if(e is java.util.concurrent.CancellationException)throw e
+     throw IllegalStateException("${SpeakerModels.name(model)}声纹提取失败，未保存：${e.message?:"请重试"}",e)}
+   }
+   JSONObject().put("version",2).put("sample_rate",RATE).put("display_name",cleanName)
+    .put("embeddings",vectors).put("speech_seconds",speech.size.toDouble()/RATE).put("continuity",selected.continuity)
+  }){json->
+   val id=UUID.randomUUID().toString();writeFile(profileFile(context,id),json)
+   ProfileInfo(id,SpeakerModels.CAM,json.getString("display_name"),setOf(SpeakerModels.CAM,SpeakerModels.ERES))
   }
  }
- @Synchronized fun delete(context:Context){
-  for(profile in allProfiles(context))AtomicFile(profileFile(context,profile.id)).delete()
+ /** Model completion must be supported by the existing initial template: the two
+  * model embedding spaces are different and a new model vector cannot verify itself. */
+ private fun verifyModelCompletion(context:Context,id:String,model:String,selected:EnrollmentSpeech):JSONObject {
+  val models=selected.continuity.optJSONObject("models")?:throw IllegalArgumentException("缺少声纹一致性证据，请重新补录")
+  for(key in listOf(SpeakerModels.CAM,SpeakerModels.ERES)){
+   val rows=models.optJSONObject(key)?.optJSONArray("windows")?:continue
+   for(i in 0 until rows.length()){
+    val row=rows.getJSONObject(i)
+    require(!(row.optBoolean("independent")&&row.optString("registered_status")=="wearer_candidate"&&
+      row.optString("registered_profile_id")!=id)){"补录中出现其他已登记人物的证据，请重新录制"}
+   }
+  }
+  val tracker=LocalSpeakerTracker(context.assets,model)
+  val matcher=Matcher(context,model,loadExtractor=false,initialOnly=true)
+  val checks=JSONArray();var at=0
+  try{
+   while(at+24000<=selected.wave.size){
+    if(Thread.currentThread().isInterrupted)throw java.util.concurrent.CancellationException("声纹学习已取消")
+    val vector=tracker.embedding(selected.wave.copyOfRange(at,at+24000))
+    val match=matcher.identifyEmbedding(vector,24000,true)
+    require(match.optString("status")=="wearer_candidate"&&match.optString("profile_id")==id){
+     "无法用原登记声纹确认补录为同一人，请在安静环境重新录制"
+    }
+    checks.put(JSONObject().put("start_sample",at).put("end_sample",at+24000)
+     .put("similarity",match.opt("similarity")?:JSONObject.NULL)
+     .put("margin",match.opt("candidate_margin")?:JSONObject.NULL))
+    at+=24000
+   }
+  }finally{try{matcher.close()}finally{tracker.close()}}
+  require(checks.length()>=2){"补录中可核验的语音不足，请重新录制"}
+  return JSONObject().put("method","independent_windows_initial_template_only")
+   .put("model",model).put("profile_id",id).put("windows",checks)
+   .put("note","试验性声纹相似度，不是身份认证；低置信度时拒绝补录")
  }
 
- /** Matcher loads the profile once and only compares embeddings from the same model. */
- class Matcher(context:Context,modelKey:String,loadExtractor:Boolean=true):AutoCloseable {
+ /** Re-recording fills only missing models, preserving stored embeddings and current name. */
+ fun supplementBothById(context:Context,id:String,samples:FloatArray):ProfileInfo {
+  data class Prepared(val originalModel:String,val missing:List<String>,val computed:JSONObject,
+                      val seconds:Double,val continuity:JSONObject,val verification:JSONObject)
+  return VoiceLearningStore.guardedProfileUpdate(context,id,{frozen->
+   val original=readFile(profileFile(frozen,id),id)?:throw IllegalArgumentException("声纹不存在")
+   val missing=listOf(SpeakerModels.CAM,SpeakerModels.ERES).filter{!original.embeddings.containsKey(it)}
+   if(missing.isEmpty())Prepared(original.model,missing,JSONObject(),0.0,JSONObject(),JSONObject())
+   else{
+    val existing=listOf(SpeakerModels.CAM,SpeakerModels.ERES).firstOrNull{original.embeddings.containsKey(it)}
+     ?:throw IllegalArgumentException("原声纹没有可用于核验的模型，请重新登记")
+    val selected=extractSpeech(frozen,samples);val speech=selected.wave
+    require(VoiceContinuityGate.targetCompatible(selected.continuity,id)){"该片段有与所选人物相反的声纹证据，未保存补录"}
+    val verification=verifyModelCompletion(frozen,id,existing,selected)
+    val computed=JSONObject()
+    for(model in missing){
+     try{computed.put(model,extractVector(frozen,model,speech))}
+     catch(e:Exception){if(e is java.util.concurrent.CancellationException)throw e
+      throw IllegalStateException("${SpeakerModels.name(model)}声纹提取失败，原声纹未改变：${e.message?:"请重试"}",e)}
+    }
+    Prepared(original.model,missing,computed,speech.size.toDouble()/RATE,selected.continuity,verification)
+   }
+  },{prepared->
+   val path=profileFile(context,id)
+   val current=readFile(path,id)?:throw IllegalArgumentException("声纹已删除，未保存补录")
+   if(prepared.missing.isEmpty())ProfileInfo(id,current.model,current.displayName,current.embeddings.keys.toSet())
+   else{
+    val json=JSONObject(AtomicFile(path).openRead().bufferedReader(Charsets.UTF_8).use{it.readText()})
+    val embeddings=if(json.getInt("version")==1)
+     JSONObject().put(json.getString("model"),json.getJSONArray("embedding")) else json.getJSONObject("embeddings")
+    for(model in prepared.missing)if(!embeddings.has(model))embeddings.put(model,prepared.computed.getJSONArray(model))
+    json.put("version",2).put("embeddings",embeddings).remove("embedding");json.remove("model")
+    json.put("supplement_speech_seconds",prepared.seconds).put("supplement_continuity",prepared.continuity)
+     .put("supplement_identity_verification",prepared.verification)
+    writeFile(path,json)
+    ProfileInfo(id,current.model,current.displayName,listOf(SpeakerModels.CAM,SpeakerModels.ERES).filter{embeddings.has(it)}.toSet())
+   }
+  })
+ }
+ fun delete(context:Context){
+  val ids=synchronized(this){allProfiles(context).map{it.id}}
+  for(id in ids)deleteById(context,id)
+ }
+
+ /** A task uses one consistent profile/template snapshot; subsequent tasks see confirmed changes. */
+ class Matcher @JvmOverloads constructor(context:Context,modelKey:String,loadExtractor:Boolean=true,
+    private val initialOnly:Boolean=false,
+    private val acceptanceThreshold:Double=RegisteredSpeakerPolicy.forModel(modelKey).acceptanceThreshold,
+    private val identityMargin:Double=RegisteredSpeakerPolicy.forModel(modelKey).identityMargin):AutoCloseable {
+  init { require(acceptanceThreshold.isFinite() && acceptanceThreshold in 0.0..1.0 && identityMargin.isFinite() && identityMargin in 0.0..1.0) }
   private val model=SpeakerModels.normalize(modelKey)
-  private val profiles=synchronized(WearerVoiceStore){allProfiles(context).filter{it.embeddings.containsKey(model)}}
+  private val originals=synchronized(WearerVoiceStore){allProfiles(context)}
+  private val supplements=if(initialOnly)emptyMap() else VoiceLearningStore.templateSnapshot(context,model)
+  private val profiles=originals.filter{it.embeddings.containsKey(model)||(!initialOnly&&!supplements[it.id].isNullOrEmpty())}
   private val tracker=if(loadExtractor && profiles.isNotEmpty())LocalSpeakerTracker(context.assets,model) else null
   val ready:Boolean get()=profiles.isNotEmpty()
   fun identify(samples:FloatArray,singleSpeaker:Boolean):JSONObject {
@@ -243,41 +315,47 @@ object WearerVoiceStore {
    return identifyEmbedding(vector,samples.size,singleSpeaker)
   }
   private fun base():JSONObject = JSONObject().put("model",SpeakerModels.name(model))
-   .put("threshold_status","experimental_uncalibrated")
+   .put("threshold_status","experimental_uncalibrated").put("initial_only",initialOnly)
    .put("note","仅供测试，不是身份认证；阈值未经目标设备和场景校准")
-  /** Compare an already extracted normalized vector; it must use this matcher's model. */
+  /** Every person has a stable profile ID. Equal display names never collapse identities. */
   fun identifyEmbedding(vector:FloatArray?,sampleCount:Int,singleSpeaker:Boolean):JSONObject {
    val out=base()
    if(profiles.isEmpty())return out.put("status","not_enrolled")
    if(!singleSpeaker)return out.put("status","ambiguous_multiple_or_unknown_speakers")
    if(sampleCount<RATE*3/2 || vector==null)return out.put("status","insufficient_audio")
-   // Entries with the same display name are one output label; avoid rejecting a
-   // matching person merely because they enrolled more than once under that name.
+   if(vector.isEmpty()||vector.any{!it.isFinite()})return out.put("status","invalid_embedding")
+   val norm=sqrt(vector.sumOf{it.toDouble()*it})
+   if(norm<=1e-8)return out.put("status","invalid_embedding")
+   val query=FloatArray(vector.size){(vector[it]/norm).toFloat()}
+   data class Match(val profile:Profile,val score:VoiceTemplateScoring.Score,val hasInitial:Boolean)
    val scores=profiles.mapNotNull{p->
-     val embedding=p.embeddings[model]?:return@mapNotNull null
-     if(vector.size!=embedding.size)return@mapNotNull null
-     p to vector.indices.sumOf{(vector[it]*embedding[it]).toDouble()}
-    }.groupBy{it.first.displayName}.values.map{matches->matches.maxByOrNull{it.second}!!}
-    .sortedByDescending{it.second}
+    val learned=supplements[p.id].orEmpty()
+    val original=p.embeddings[model]
+    val anchor=original?:learned.firstOrNull()?:return@mapNotNull null
+    VoiceTemplateScoring.score(query,anchor,learned).let{score->
+     if(score==null)null else Match(p,score,original!=null)
+    }
+   }.sortedByDescending{it.score.similarity}
    if(scores.isEmpty())return out.put("status","dimension_mismatch")
-   val best=scores[0];val similarity=best.second
-   val runnerUp=scores.getOrNull(1)?.second
+   val best=scores[0];val similarity=best.score.similarity
+   val runnerUp=scores.getOrNull(1)?.score?.similarity
    val margin=runnerUp?.let{similarity-it}
    val status=when {
-    similarity>=0.65 && (margin==null || margin>=0.08)->"wearer_candidate"
+    similarity>=acceptanceThreshold && (margin==null || margin>=identityMargin)->"wearer_candidate"
     similarity<=0.35->"other_candidate"
     else->"uncertain"
    }
-   if(status=="wearer_candidate")out.put("display_name",best.first.displayName).put("profile_id",best.first.id)
-   // This is not an identification: consumers may show it only as an uncertain
-   // candidate after applying their model-specific score and ambiguity policy.
-   if(status=="uncertain")out.put("nearest_candidate_name",best.first.displayName)
-    .put("nearest_candidate_profile_id",best.first.id)
-   return out.put("similarity",similarity).put("runner_up_similarity",runnerUp?:JSONObject.NULL)
-    .put("candidate_margin",margin?:JSONObject.NULL).put("ambiguity_margin_threshold",0.08)
-    .put("wearer_candidate_threshold",0.65)
-    .put("other_candidate_threshold",0.35)
-    .put("status",status)
+   if(status=="wearer_candidate")out.put("display_name",best.profile.displayName).put("profile_id",best.profile.id)
+   if(status=="uncertain")out.put("nearest_candidate_name",best.profile.displayName)
+    .put("nearest_candidate_profile_id",best.profile.id)
+   return out.put("similarity",similarity)
+    .put("base_similarity",if(best.hasInitial)best.score.initial else JSONObject.NULL)
+    .put("supplement_count",best.score.supplementCount)
+    .put("best_profile_id",best.profile.id)
+    .put("runner_up_profile_id",scores.getOrNull(1)?.profile?.id?:JSONObject.NULL)
+    .put("runner_up_similarity",runnerUp?:JSONObject.NULL)
+    .put("candidate_margin",margin?:JSONObject.NULL).put("ambiguity_margin_threshold",identityMargin)
+    .put("wearer_candidate_threshold",acceptanceThreshold).put("other_candidate_threshold",0.35).put("status",status)
   }
   override fun close(){tracker?.close()}
  }
