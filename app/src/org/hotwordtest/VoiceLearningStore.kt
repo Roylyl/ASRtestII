@@ -95,9 +95,27 @@ object VoiceLearningStore {
   require(json.getJSONArray("candidates").length()<=MAX_CANDIDATES){"待确认样本过多"}
   json.getJSONArray("samples");json.getJSONArray("ignored")
   if(!json.has("history"))json.put("history",JSONArray())
+  recoverRecurringCommit(context,json)
   cleanOrphanAudio(context,json)
   return json
  }
+ /** The journal is a commit record, not an unverified proposal. Once written it
+  * is finished on restart before either matching or learning can use the roster. */
+ private fun recoverRecurringCommit(context:Context,state:JSONObject){
+  val journal=state.optJSONArray("recurring_commit")?:return
+  require(journal.length() in 1..2){"自动人物提交记录无效，原数据已保留"}
+  val consumed=mutableSetOf<String>()
+  for(i in 0 until journal.length()){
+   val job=journal.getJSONObject(i);val id=job.getString("profile_id")
+   WearerVoiceStore.installRecurringProfile(context,id,job.getJSONObject("profile"))
+   for(seed in objects(job.getJSONArray("consumed_candidates"))){
+    consumed.add(seed.getString("id"));ignore(state,seed)
+   }
+  }
+  state.put("candidates",keep(state.getJSONArray("candidates")){it.getString("id") !in consumed})
+  state.remove("recurring_commit");save(context,state)
+ }
+ internal fun recoverRecurringProfiles(context:Context)=synchronized(lock){load(context);Unit}
  private fun save(context:Context,json:JSONObject){
   val bytes=json.toString().toByteArray(Charsets.UTF_8)
   require(bytes.size<=8*1024*1024){"声纹学习数据已满，请先清理样本"}
@@ -286,7 +304,10 @@ object VoiceLearningStore {
   }.sortedByDescending{it.createdMs}
  }
  fun listSamples(context:Context,profileId:String):List<SampleInfo> = synchronized(lock){objects(load(context).getJSONArray("samples")).filter{it.getString("profile")==profileId}.map(::sample).sortedByDescending{it.createdMs}}
- fun activeOrigins(context:Context,profileId:String):List<Origin> = synchronized(lock){objects(load(context).getJSONArray("samples")).filter{it.getString("profile")==profileId}.map(::origin)}
+ fun activeOrigins(context:Context,profileId:String):List<Origin> = synchronized(lock){
+  val learned=objects(load(context).getJSONArray("samples")).filter{it.getString("profile")==profileId}.map(::origin)
+  learned+WearerVoiceStore.recurringOrigins(context,profileId)
+ }
  fun activeSources(context:Context,profileId:String):Set<String> = activeOrigins(context,profileId).map{it.source}.toSet()
  fun matchesLearningSource(context:Context,profileId:String,source:String,startSample:Long,endSample:Long):Boolean =
   activeOrigins(context,profileId).any{overlaps(it,Origin(source,startSample,endSample))}
@@ -329,8 +350,11 @@ object VoiceLearningStore {
  }
  /** Only analyzer-issued candidates can use the already-checked activity path. */
  fun quality(context:Context,candidate:SpeechEvidence.PureCandidate):Quality {
+  return measurePureQuality(context,candidate.samples(),candidate.startSample,candidate.endSample,candidate.evidenceJson())
+ }
+ /** Private measurement of one already-bound pure interval; never changes PCM. */
+ private fun measurePureQuality(context:Context,samples:FloatArray,start:Long,end:Long,evidence:JSONObject):Quality {
   active()
-  val samples=candidate.samples()
   if(samples.size<RATE*3)return Quality(false,"有效录音至少需要3秒")
   val rms=sqrt(samples.sumOf{it.toDouble()*it}/samples.size)
   val clipped=samples.count{abs(it)>=0.995f}.toDouble()/samples.size
@@ -349,7 +373,7 @@ object VoiceLearningStore {
   // Use exactly the candidate interval for both playback and embedding; VAD is a gate,
   // not a second edit that silently splices different audio together.
   return Quality(true,"连续独占语音质量检查通过",count,fraction,rms,clipped,true,false,samples,
-   candidate.startSample,candidate.endSample,candidate.evidenceJson())
+   start,end,evidence)
  }
  internal data class Admission(val candidate:SpeechEvidence.PureCandidate,val quality:Quality,val gate:VoiceContinuityGate.Result)
  internal data class Assessment(val admission:Admission?,val reason:String,val diagnostic:JSONObject?=null)
@@ -531,6 +555,9 @@ object VoiceLearningStore {
     .put("end_sample",piece.row.end).put("text",piece.row.text).put("stable_id",piece.row.stableId?:JSONObject.NULL)
     .put("covered_start_sample",piece.start).put("covered_end_sample",piece.end))}}))
   item.getJSONObject("quality").put("continuity",consistent.evidence)
+  if(collectionRunId!=null&&scope==null&&retryParentId==null&&
+     consistent.evidence.optString("status")=="review_required"&&
+     !AutomaticRetryPlan.edgeRescueReviewOnly(consistent.evidence))item.put("recurring_eligible",true)
   return synchronized(lock){ synchronized(WearerVoiceStore) {
    val commit:()->CandidateInfo? = commit@{
    active()
@@ -570,6 +597,186 @@ object VoiceLearningStore {
    .firstOrNull{it.getString("id")==candidateId&&it.optString("collection_run_id")==collectionRunId}?:return@synchronized false
   val safe=JSONObject(diagnostic.toString());require(safe.toString().length<=131072){"声纹诊断过大"}
   pending.put("auto_diagnostic",safe);save(context,state);true
+ }
+ /** Accumulate anonymous, acoustically checked candidates across tasks. A task
+  * contributes evidence only while auto learning is enabled; no registration is
+  * required. Current recognition keeps its already-created Matcher snapshot. */
+ internal fun learnRecurring(context:Context,collectionRunId:String,isEnabledNow:()->Boolean,
+                             guardedCommit:((()->Unit)->Unit)):JSONArray {
+  require(uuid.matches(collectionRunId)){"学习任务编号无效"}
+  val events=JSONArray()
+  fun enabled(){active();if(!isEnabledNow())throw java.util.concurrent.CancellationException("自动学习已关闭")}
+  data class Batch(val records:List<String>,val identity:IdentitySnapshot)
+  enabled()
+  val batch=synchronized(lock){
+   val state=load(context)
+   val eligible=objects(state.getJSONArray("candidates")).filter{item->
+    item.optBoolean("recurring_eligible")&&uuid.matches(item.optString("collection_run_id"))&&
+    !item.has("automatic_retry_parent")&&!item.has("span_context")&&currentAcousticEvidence(item)&&
+    continuity(item)?.optString("status")=="review_required"&&
+    !AutomaticRetryPlan.edgeRescueReviewOnly(continuity(item))
+   }
+   if(eligible.none{it.optString("collection_run_id")==collectionRunId})return events
+   Batch(eligible.map{it.toString()},identitySnapshot(context,state))
+  }
+  val items=batch.records.map{JSONObject(it)}.associateBy{it.getString("id")}
+  fun vectorMap(json:JSONObject):Map<String,FloatArray> = listOf(SpeakerModels.CAM,SpeakerModels.ERES).associateWith{model->
+   val a=json.getJSONArray(model);require(a.length() in 1..4096){"声纹向量无效"}
+   val v=FloatArray(a.length()){a.getDouble(it).toFloat()}
+   require(v.all{it.isFinite()}){"声纹向量无效"};val n=sqrt(v.sumOf{it.toDouble()*it})
+   require(n>1e-8){"声纹向量无效"};FloatArray(v.size){(v[it]/n).toFloat()}
+  }
+  fun evidence(item:JSONObject,vectors:Map<String,FloatArray> = vectorMap(item.getJSONObject("vectors")),
+               start:Long=item.getLong("start"),end:Long=item.getLong("end")) =
+   RecurringSpeakerPolicy.Evidence(item.getString("id"),item.getString("source"),start,end,vectors,true)
+  fun pending(ids:List<String>,reason:String,reasonCode:String?=null){events.put(JSONObject().put("status","pending")
+   .put("candidate_ids",JSONArray(ids)).put("reason",reason).apply{if(reasonCode!=null)put("reason_code",reasonCode)})}
+  data class Existing(val candidateId:String,val profileId:String,val runId:String)
+  val existing=mutableListOf<Existing>();val proposals=JSONArray()
+  withIdentitySnapshot(context,batch.identity){frozen->
+   enabled()
+   WearerVoiceStore.Matcher(frozen,SpeakerModels.CAM,false,false,0.70,0.15).use{cam->
+    WearerVoiceStore.Matcher(frozen,SpeakerModels.ERES,false,false,0.70,0.15).use{eres->
+     fun matches(v:Map<String,FloatArray>,count:Int)=listOf(
+      cam.identifyEmbedding(v.getValue(SpeakerModels.CAM),count,true),
+      eres.identifyEmbedding(v.getValue(SpeakerModels.ERES),count,true))
+     fun hasExistingRisk(scores:List<JSONObject>)=scores.any{score->
+      when(score.optString("status")){
+       "not_enrolled"->false
+       "other_candidate","uncertain","wearer_candidate"->{
+        val similarity=score.optDouble("similarity",Double.NaN)
+        !similarity.isFinite()||similarity>0.35
+       }
+       else->true // Failed comparisons cannot establish that this is a new person.
+      }
+     }
+     val anonymous=mutableListOf<RecurringSpeakerPolicy.Evidence>()
+     for(item in items.values){
+      enabled();val id=item.getString("id")
+      try{
+       val candidate=evidence(item);val scored=matches(candidate.vectors,(candidate.end-candidate.start).toInt())
+       val target=scored[0].optString("profile_id")
+       if(target.isNotBlank()&&scored.all{it.optString("status")=="wearer_candidate"&&it.optString("profile_id")==target}){
+        existing.add(Existing(id,target,item.getString("collection_run_id")))
+       }else if(hasExistingRisk(scored))pending(listOf(id),"与已有人物接近但双模型证据不足，继续积累，避免拆成新人")
+       else anonymous.add(candidate)
+      }catch(e:java.util.concurrent.CancellationException){throw e}
+      catch(e:Exception){pending(listOf(id),e.message?:"候选证据不可用")}
+     }
+     val decision=RecurringSpeakerPolicy.decide(anonymous)
+     for((reason,rejected) in decision.rejected.filter{
+      items.getValue(it.evidence.id).optString("collection_run_id")==collectionRunId
+     }.groupBy{it.reason}){
+      val explanation=when(reason){
+       "insufficient_recurrence"->"继续积累至少3段、累计9秒的独立纯净语音，证据一致后自动建立人物"
+       "overlap_or_insufficient_gap"->"语音区间重叠或间隔不足，等待其他独立片段"
+       "duplicate_vectors","duplicate_id"->"重复语音不增加证据，等待新的独立片段"
+       "ambiguous_groups","insufficient_margin"->"与多个人物组接近，继续积累明确证据，暂不自动学习"
+       "short_or_invalid_interval"->"有效语音不足3秒，等待更完整的纯净片段"
+       "acoustic_not_strong"->"纯净语音证据不足，等待其他片段"
+       else->"候选证据无效，等待新的完整纯净语音"
+      }
+      pending(rejected.map{it.evidence.id},explanation,reason)
+     }
+     val groups=decision.groups.filter{g->
+      g.any{items.getValue(it.id).optString("collection_run_id")==collectionRunId}
+     }.take(2)
+     val selectedIds=groups.flatMap{it.take(3)}.map{it.id}.toSet()
+     val waiting=decision.groups.flatten().filter{
+      it.id !in selectedIds&&items.getValue(it.id).optString("collection_run_id")==collectionRunId
+     }.map{it.id}
+     if(waiting.isNotEmpty())pending(waiting,"本轮已限制复核数量，候选保留供后续任务继续学习","batch_limit")
+     val usedNames=WearerVoiceStore.listProfiles(frozen).map{it.name}.toMutableSet()
+     for(group in groups){
+      enabled();val seeds=group.take(3);val ids=seeds.map{it.id}
+      try{
+       val refreshed=seeds.map{seed->
+        enabled();val item=items.getValue(seed.id)
+        val pcm=synchronized(lock){
+         val current=objects(load(context).getJSONArray("candidates")).firstOrNull{it.getString("id")==seed.id}
+         require(current?.toString()==item.toString()){"候选已变更，停止自动建人"}
+         audioFile(context,seed.id).inputStream().use{WavReader.read16k(it)}
+        }
+        require(pcm.size.toLong()==seed.end-seed.start){"候选音频与来源区间不一致"}
+        // The saved analyzer proof is bound to this exact source and sample range.
+        // Re-measure the same PCM without cutting already-protected boundaries a
+        // second time; short valid candidates must not lose another edge margin.
+        val acoustic=item.getJSONObject("quality").getJSONObject("evidence")
+        require(acoustic.optString("source")==seed.source&&acoustic.optLong("start_sample",-1)==seed.start&&
+         acoustic.optLong("end_sample",-1)==seed.end&&currentAcousticEvidence(item)){"候选原始活动凭证与来源不一致"}
+        val quality=measurePureQuality(frozen,pcm,seed.start,seed.end,acoustic)
+        require(quality.accepted&&quality.speech!=null){quality.reason}
+        val start=requireNotNull(quality.sourceStartSample)
+        val end=requireNotNull(quality.sourceEndSample)
+        require(start>=seed.start&&end<=seed.end){"复核语音超出候选来源"}
+        val fresh=VoiceContinuityGate.check(frozen,quality.speech,start)
+        require(fresh.accepted&&fresh.evidence.optString("status")=="review_required"&&
+         !AutomaticRetryPlan.edgeRescueReviewOnly(fresh.evidence)){"复核发现片段内部声纹不一致"}
+        val vectors=vectorMap(embeddings(frozen,quality.speech))
+        require(!hasExistingRisk(matches(vectors,quality.speech.size))){"复核与已有人物接近，保留候选避免重复建人"}
+        evidence(item,vectors,start,end)
+       }
+       require(RecurringSpeakerPolicy.groups(refreshed).any{it.map{e->e.id}.toSet()==ids.toSet()}){
+        "重新提取后独立语音证据不足，继续积累"}
+       val id=UUID.randomUUID().toString();var number=1
+       while("人物$number" in usedNames)number++
+       val name="人物$number";usedNames.add(name)
+       val centers=JSONObject()
+       for(model in listOf(SpeakerModels.CAM,SpeakerModels.ERES)){
+        val dimensions=refreshed.first().vectors.getValue(model).size
+        require(refreshed.all{it.vectors.getValue(model).size==dimensions})
+        val mean=DoubleArray(dimensions){index->refreshed.sumOf{it.vectors.getValue(model)[index].toDouble()}}
+        val norm=sqrt(mean.sumOf{it*it});require(norm>1e-8)
+        centers.put(model,JSONArray().apply{mean.forEach{put(it/norm)}})
+       }
+       val origins=JSONArray().apply{refreshed.forEach{seed->put(JSONObject().put("candidate_id",seed.id)
+        .put("source",seed.source).put("start",seed.start).put("end",seed.end))}}
+       val profile=JSONObject().put("version",2).put("sample_rate",RATE).put("display_name",name)
+        .put("embeddings",centers).put("origin","automatic_recurring").put("recurring_commit_id",id)
+        .put("recurring_seeds",origins).put("speech_seconds",refreshed.sumOf{it.end-it.start}.toDouble()/RATE)
+        .put("created_at",System.currentTimeMillis())
+       proposals.put(JSONObject().put("profile_id",id).put("profile",profile)
+        .put("consumed_candidates",JSONArray().apply{seeds.forEach{put(JSONObject(items.getValue(it.id).toString()))}}))
+      }catch(e:java.util.concurrent.CancellationException){throw e}
+      catch(e:Exception){pending(ids,e.message?:"自动建人复核未通过")}
+     }
+    }
+   }
+  }
+  if(proposals.length()>0)guardedCommit{
+   synchronized(lock){synchronized(WearerVoiceStore){
+    enabled();val state=load(context)
+    require(batch.identity.sameAs(identitySnapshot(context,state))){"人物库已变更，自动建人未提交"}
+    val current=objects(state.getJSONArray("candidates")).associateBy{it.getString("id")}
+    for(job in objects(proposals))for(item in objects(job.getJSONArray("consumed_candidates")))
+     require(current[item.getString("id")]?.toString()==item.toString()){"候选已变更，自动建人未提交"}
+    state.put("recurring_commit",proposals);save(context,state)
+    recoverRecurringCommit(context,state);cleanOrphanAudio(context,state)
+    for(job in objects(proposals))events.put(JSONObject().put("status","discovered")
+     .put("profile_id",job.getString("profile_id")).put("name",job.getJSONObject("profile").getString("display_name"))
+     .put("candidate_ids",JSONArray(objects(job.getJSONArray("consumed_candidates")).map{it.getString("id")})))
+   }}
+  }
+  // Classification used the original frozen roster. New profiles never justify
+  // another candidate in this same batch; existing profiles use the normal strict
+  // confirmation path, including initial-template, deletion and cancel guards.
+  for(item in existing.take(2)){
+   try{
+    enabled()
+    confirmCandidateAutomatic(context,item.candidateId,item.profileId,item.runId,{enabled();true}){commit->
+     var saved:SampleInfo?=null;guardedCommit{saved=commit()};requireNotNull(saved)
+    }
+    events.put(JSONObject().put("status","learned").put("profile_id",item.profileId)
+     .put("candidate_ids",JSONArray(listOf(item.candidateId))).put("candidate_id",item.candidateId))
+   }catch(e:java.util.concurrent.CancellationException){break}
+   catch(e:Exception){
+    // The caller's final commit guard may reject closure with require(), while
+    // previously committed discoveries must still reach the run's result rows.
+    if(!isEnabledNow()||Thread.currentThread().isInterrupted)break
+    pending(listOf(item.candidateId),e.message?:"补充样本未通过严格检查")
+   }
+  }
+  return events
  }
  private fun confirmCandidateInternal(context:Context,candidateId:String,profileId:String,automatic:Boolean,isEnabledNow:()->Boolean,
                                       collectionRunId:String?=null,guardedCommit:((()->SampleInfo)->SampleInfo)?=null):SampleInfo {

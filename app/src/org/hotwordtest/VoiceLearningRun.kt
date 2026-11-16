@@ -49,7 +49,7 @@ internal class VoiceLearningRun @JvmOverloads constructor(private val context:Co
   if(saved.startSample<candidate.startSample||saved.endSample>candidate.endSample)return no("候选区间超出原声学证据")
   if(explicitOverlap(entry,"speaker_display"))return no("说话人存在重叠或冲突")
   val stable=(entry.opt("stable_speaker_id") as? String).orEmpty()
-  if(!stable.startsWith("profile:")||stable.length<=8)return no("未确认已登记人物")
+  if(!stable.startsWith("profile:")||stable.length<=8)return no("尚未匹配已有稳定人物，继续积累独立声音片段")
   val id=stable.substringAfter("profile:")
   val identity=entry.optJSONObject("wearer_identity")?:entry.optJSONObject("voice_identity")?:return no("缺少人物识别证据")
   if(identity.optString("status")!="wearer_candidate"||identity.optString("profile_id")!=id)return no("人物归属未确认或不一致")
@@ -198,7 +198,7 @@ internal class VoiceLearningRun @JvmOverloads constructor(private val context:Co
      var rejected=""
      var allowedProfile:String?=null
      var allowedCandidate:SpeechEvidence.PureCandidate?=null
-     var ineligibleReason=if(enabledAtStart)"候选未关联已确认的登记人物" else "自动学习在任务开始时未开启"
+     var ineligibleReason=if(enabledAtStart)"正在积累独立声音片段，尚未建立稳定人物" else "自动学习在任务开始时未开启"
      var retryAllowed=true
      val qualityRejected=mutableListOf<LearningCandidateSequence.Item<SpeechEvidence.PureCandidate>>()
      var reviewRescue=false
@@ -498,9 +498,37 @@ internal class VoiceLearningRun @JvmOverloads constructor(private val context:Co
   }
   }finally{publishUnattempted("任务已取消或自动学习已关闭，未开始自动校验");publishInterrupted()}
  }
+ private fun learnRecurringSpeakers(){
+  if(!enabledAtStart||cancelled||!autoGuard.isActive(isEnabledNow))return
+  try{
+   val outcomes=VoiceLearningStore.learnRecurring(context,collectionRunId,
+    {autoGuard.isActive(isEnabledNow)},{commit->autoGuard.commit(isEnabledNow,commit)})
+   synchronized(this){for(i in 0 until outcomes.length()){
+    val outcome=outcomes.getJSONObject(i);val status=outcome.optString("status")
+    val ids=outcome.optJSONArray("candidate_ids")?:JSONArray().apply{
+     outcome.optString("candidate_id").takeIf{it.isNotBlank()}?.let{put(it)}
+    }
+    val affected=(0 until ids.length()).map{ids.getString(it)}.toSet()
+    if(status=="discovered"||status=="learned"){
+     savedCandidateIds.removeAll(affected)
+     autoOutcomes.removeAll{it.optString("candidate_id") in affected&&it.optString("status")!="learned"}
+     turns.values.filter{it.candidateId in affected}.forEach{row->
+      row.candidateId=null
+      row.reason=if(status=="discovered")"已自动建立常见说话人的声纹；下次识别生效" else "已自动补充声纹；下次识别生效"
+     }
+    }else if(status=="pending"){
+     turns.values.filter{it.candidateId in affected}.forEach{it.reason=outcome.optString("reason","正在积累独立声音片段")}
+    }
+    autoOutcomes.add(outcome)
+   }}
+  }catch(_:java.util.concurrent.CancellationException){
+   publishUnattempted("任务已取消或自动学习已关闭，未继续积累人物")
+  }catch(e:Exception){synchronized(this){autoOutcomes.add(JSONObject().put("status","discovery_failed")
+   .put("reason",e.message?:"自动人物积累暂未完成，候选已保留"))}}
+ }
  fun finish(){
   executor.shutdown()
-  try{while(!executor.awaitTermination(250,TimeUnit.MILLISECONDS)){if(Thread.currentThread().isInterrupted){cancelled=true;autoGuard.cancel();collectionGuard.cancel();executor.shutdownNow();clearReservations();return}};runAutomatic()}
+  try{while(!executor.awaitTermination(250,TimeUnit.MILLISECONDS)){if(Thread.currentThread().isInterrupted){cancelled=true;autoGuard.cancel();collectionGuard.cancel();executor.shutdownNow();clearReservations();return}};runAutomatic();learnRecurringSpeakers()}
   catch(_:InterruptedException){cancelled=true;autoGuard.cancel();collectionGuard.cancel();executor.shutdownNow();clearReservations();Thread.currentThread().interrupt()}
   finally{analyzer?.close();analyzer=null}
  }
@@ -508,11 +536,13 @@ internal class VoiceLearningRun @JvmOverloads constructor(private val context:Co
  @Synchronized fun summary():String {
   val count=savedCandidateIds.size
   val learned=autoOutcomes.count{it.optString("status")=="learned"}
+  val discovered=autoOutcomes.count{it.optString("status")=="discovered"}
   if(cancelled)return "任务已取消；已完成的候选保留，未完成候选未保存"
-  val base=if(count>0)"本次收集"+count+"条待确认声纹候选" else "本次没有新增待确认候选"
+  val base=if(count>0)"本次保留"+count+"条声纹候选" else "本次没有剩余声纹候选"
   val reviewCount=turns.values.count{it.reviewRescue&&it.candidateId!=null}
   val withReview=if(reviewCount>0)base+"（其中"+reviewCount+"条为质量补救，仅待确认）" else base
-  val withAuto=if(learned>0)withReview+"；自动学习"+learned+"条" else withReview
+  val withLearning=if(learned>0)withReview+"；自动学习"+learned+"条" else withReview
+  val withAuto=if(discovered>0)withLearning+"；自动认识"+discovered+"位说话人" else withLearning
   val spans=if(unsavedSpanKeys.isEmpty())withAuto else withAuto+"；"+unsavedSpanKeys.size+"条跨行候选未保存"
   return if(timedOutKeys.isEmpty())spans else spans+"；其中或另有"+timedOutKeys.size+"条候选等待超时、未筛选"
  }

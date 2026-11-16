@@ -163,8 +163,8 @@ class VoiceEnrollmentDialog(
   addCard(content,button("待确认学习片段 · ${candidates.size}条"){showCandidates()})
   if(profiles.isEmpty()){
    val empty=card();empty.gravity=Gravity.CENTER;empty.setPadding(dp(18),dp(35),dp(18),dp(35))
-   empty.addView(label("还没有保存的声纹",16,Color.DKGRAY).apply{gravity=Gravity.CENTER;setTypeface(null,Typeface.BOLD)})
-   empty.addView(label("点击右上角＋，录制并命名。",13,grey).apply{gravity=Gravity.CENTER;setPadding(0,dp(8),0,0)})
+   empty.addView(label("等待自动认识说话人",16,Color.DKGRAY).apply{gravity=Gravity.CENTER;setTypeface(null,Typeface.BOLD)})
+   empty.addView(label("开启自动学习后正常录音即可，无需先登记。也可点击＋手动添加。",13,grey).apply{gravity=Gravity.CENTER;setPadding(0,dp(8),0,0)})
    addCard(content,empty)
   }else profiles.forEach{profile->
    val row=card();val top=LinearLayout(activity).apply{orientation=LinearLayout.HORIZONTAL;gravity=Gravity.CENTER_VERTICAL}
@@ -207,9 +207,9 @@ class VoiceEnrollmentDialog(
   banner?.let{addCard(content,label(it,14,Color.rgb(32,130,77)),4)}
   content.addView(label(profile.name,22).apply{setTypeface(null,Typeface.BOLD);setPadding(dp(3),0,0,dp(14))})
   addCard(content,card().apply{
-   addView(label("初始登记模板",17).apply{setTypeface(null,Typeface.BOLD)})
+   addView(label("初始声纹模板",17).apply{setTypeface(null,Typeface.BOLD)})
    addView(label(profile.models.joinToString("、"){SpeakerModels.name(it)}+" · 保留",13,grey).apply{setPadding(0,dp(7),0,0)})
-   addView(label("补充样本和撤销学习均以同一个用户记录管理。初始登记模板持续参与匹配。",13,grey).apply{setPadding(0,dp(8),0,0);setLineSpacing(dp(3).toFloat(),1f)})
+   addView(label("自动认识或手动添加的人物均使用稳定ID。补充、重命名和撤销学习不会另建人物，初始模板持续参与匹配。",13,grey).apply{setPadding(0,dp(8),0,0);setLineSpacing(dp(3).toFloat(),1f)})
   })
   addCard(content,button("补录同一个人的声音",true){if(readyToChange())openAppend(id,profile.name)})
   addCard(content,button("撤销最近一次学习"){

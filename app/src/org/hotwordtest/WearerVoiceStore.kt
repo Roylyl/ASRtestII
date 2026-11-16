@@ -91,13 +91,48 @@ object WearerVoiceStore {
  }
 
  fun listProfiles(context:Context):List<ProfileInfo> {
+  VoiceLearningStore.recoverRecurringProfiles(context)
   val profiles=synchronized(this){allProfiles(context)}
   val learnedModels=VoiceLearningStore.modelSupport(context)
   return profiles.map{
    ProfileInfo(it.id,it.model,it.displayName,it.embeddings.keys.toSet()+learnedModels[it.id].orEmpty())
   }
  }
+ /** Complete an already committed discovery journal. Replaying must not rename or
+  * replace an existing profile, including one the user renamed after creation. */
+ @Synchronized internal fun installRecurringProfile(context:Context,id:String,json:JSONObject) {
+  require(validId.matches(id)&&json.optString("recurring_commit_id")==id){"自动人物提交编号无效"}
+  require(json.getInt("version")==2&&json.getJSONObject("embeddings").has(SpeakerModels.CAM)&&
+   json.getJSONObject("embeddings").has(SpeakerModels.ERES)){"自动人物缺少双模型声纹"}
+  for(model in listOf(SpeakerModels.CAM,SpeakerModels.ERES)){
+   val values=json.getJSONObject("embeddings").getJSONArray(model)
+   require(values.length() in 1..4096){"自动人物声纹维度无效"}
+   val v=DoubleArray(values.length()){values.getDouble(it)}
+   require(v.all{it.isFinite()}&&v.sumOf{it*it}>1e-8){"自动人物声纹数据无效"}
+  }
+  validName(json.getString("display_name"))
+  val path=profileFile(context,id)
+  if(path.exists()||File(path.path+".bak").exists()){
+   val old=JSONObject(AtomicFile(path).openRead().bufferedReader(Charsets.UTF_8).use{it.readText()})
+   require(old.optString("recurring_commit_id")==id){"人物编号已被其他声纹使用"}
+   requireNotNull(readFile(path,id));return
+  }
+  writeFile(path,json)
+  requireNotNull(readFile(path,id))
+ }
  @Synchronized internal fun hasProfile(context:Context,id:String)=readFile(profileFile(context,id),id)!=null
+ /** Caller holds the learning lock, so journal recovery and origin reads use the
+  * same learning -> profile order as sample commits and profile deletion. */
+ @Synchronized internal fun recurringOrigins(context:Context,id:String):List<VoiceLearningStore.Origin> {
+  val path=profileFile(context,id)
+  if(readFile(path,id)==null)return emptyList()
+  val json=JSONObject(AtomicFile(path).openRead().bufferedReader(Charsets.UTF_8).use{it.readText()})
+  val seeds=json.optJSONArray("recurring_seeds")?:return emptyList()
+  return (0 until seeds.length()).map{index->
+   val seed=seeds.getJSONObject(index)
+   VoiceLearningStore.Origin(seed.getString("source"),seed.getLong("start"),seed.getLong("end"))
+  }
+ }
  @Synchronized fun hasInitialTemplate(context:Context,id:String,modelKey:String):Boolean =
   readFile(profileFile(context,id),id)?.embeddings?.containsKey(SpeakerModels.normalize(modelKey))==true
 
@@ -303,7 +338,7 @@ object WearerVoiceStore {
     private val identityMargin:Double=RegisteredSpeakerPolicy.forModel(modelKey).identityMargin):AutoCloseable {
   init { require(acceptanceThreshold.isFinite() && acceptanceThreshold in 0.0..1.0 && identityMargin.isFinite() && identityMargin in 0.0..1.0) }
   private val model=SpeakerModels.normalize(modelKey)
-  private val originals=synchronized(WearerVoiceStore){allProfiles(context)}
+  private val originals=run{VoiceLearningStore.recoverRecurringProfiles(context);synchronized(WearerVoiceStore){allProfiles(context)}}
   private val supplements=if(initialOnly)emptyMap() else VoiceLearningStore.templateSnapshot(context,model)
   private val profiles=originals.filter{it.embeddings.containsKey(model)||(!initialOnly&&!supplements[it.id].isNullOrEmpty())}
   private val tracker=if(loadExtractor && profiles.isNotEmpty())LocalSpeakerTracker(context.assets,model) else null

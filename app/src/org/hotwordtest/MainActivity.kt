@@ -556,7 +556,7 @@ class MainActivity:Activity(){
    isChecked=prefs.getBoolean("auto_voice_learning",true)
    setOnCheckedChangeListener{_,checked->prefs.edit().putBoolean("auto_voice_learning",checked).apply();invalidate()}
   },LinearLayout.LayoutParams(-1,dp(48)).apply{topMargin=dp(8)})
-  pending.addView(text("识别结束后自动审核已登记人物的高可信片段，符合条件才追加，下一次识别生效。未通过的候选仍可手动确认；关闭后仅停止自动追加。初始声纹保留。",13,Color.GRAY).apply{setPadding(0,dp(8),0,0);setLineSpacing(dp(3).toFloat(),1f)})
+  pending.addView(text("不用先登记。正常录音或导入文件，应用会积累反复出现的声音。至少3段独立纯净语音、累计9秒，且两种模型一致，才自动建立“人物1”等声纹。之后继续补充，下一次识别生效；你可以随时命名或删除。关闭后停止自动建人和追加。",13,Color.GRAY).apply{setPadding(0,dp(8),0,0);setLineSpacing(dp(3).toFloat(),1f)})
   val count=runCatching{VoiceLearningStore.listCandidates(this).size}.getOrNull()
   learningCandidatesAction=addAction(pending,if(count==null)"待确认学习片段" else "待确认学习片段 · ${count}条",true){voiceEnrollment.showCandidates()}
   if(!available)pending.addView(text("请先结束当前识别或声纹处理。",12,Color.GRAY).apply{setPadding(0,dp(8),0,0)})
