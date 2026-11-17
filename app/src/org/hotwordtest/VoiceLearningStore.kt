@@ -150,7 +150,7 @@ object VoiceLearningStore {
    val old=rows.optJSONObject(i)?:return false;val now=current[i]
    if(old.optLong("start_sample",-1)!=now.row.start||old.optLong("end_sample",-1)!=now.row.end||
     old.optLong("covered_start_sample",-1)!=now.start||old.optLong("covered_end_sample",-1)!=now.end||
-    old.optString("text")!=now.row.text||old.optString("stable_id")!=now.row.stableId)return false
+    old.optString("text")!=now.row.text||old.opt("stable_id").let{it as? String}!=now.row.stableId)return false
   }
   return true
  }
@@ -375,7 +375,8 @@ object VoiceLearningStore {
   return Quality(true,"连续独占语音质量检查通过",count,fraction,rms,clipped,true,false,samples,
    start,end,evidence)
  }
- internal data class Admission(val candidate:SpeechEvidence.PureCandidate,val quality:Quality,val gate:VoiceContinuityGate.Result)
+ internal data class Admission(val candidate:SpeechEvidence.PureCandidate,val quality:Quality,val gate:VoiceContinuityGate.Result,
+                              val sharedWindows:VoiceContinuityGate.SharedWindows?)
  internal data class Assessment(val admission:Admission?,val reason:String,val diagnostic:JSONObject?=null)
  private fun qualityFailure(candidate:SpeechEvidence.PureCandidate,q:Quality):Assessment {
   val data=JSONObject().put("version",1).put("stage","quality").put("status","rejected")
@@ -414,13 +415,15 @@ object VoiceLearningStore {
   * waveform must independently pass all the original checks and never gains new audio. */
  private fun assessProtected(context:Context,candidate:SpeechEvidence.PureCandidate,profileId:String?=null):Assessment {
   val firstQuality=quality(context,candidate)
-  val firstGate=if(firstQuality.accepted)VoiceContinuityGate.check(context,checkNotNull(firstQuality.speech),candidate.startSample) else null
+  val firstSpeech=firstQuality.speech
+  val firstWindows=if(profileId!=null&&firstQuality.accepted)VoiceContinuityGate.SharedWindows(checkNotNull(firstSpeech)) else null
+  val firstGate=if(firstQuality.accepted)VoiceContinuityGate.check(context,checkNotNull(firstSpeech),candidate.startSample,firstWindows) else null
   if(firstGate?.accepted==true){
    if(profileId!=null&&!VoiceContinuityGate.targetCompatible(firstGate.evidence,profileId)){
     val reason="该片段有与所选人物相反的声纹证据"
     return Assessment(null,reason,VoiceLearningDiagnostic.failure("target_conflict",reason,firstGate.evidence,profileId))
    }
-   return Assessment(Admission(candidate,firstQuality,firstGate),firstGate.reason)
+   return Assessment(Admission(candidate,firstQuality,firstGate,firstWindows),firstGate.reason)
   }
   val reason=firstGate?.reason?:firstQuality.reason
   val retry=if(firstGate!=null){
@@ -436,7 +439,9 @@ object VoiceLearningStore {
   }?:return firstFailure
   val reduced=candidate.clip(candidate.startSample+crop.start,candidate.startSample+crop.end)?:return firstFailure
   val checked=quality(context,reduced);if(!checked.accepted)return firstFailure
-  val gate=VoiceContinuityGate.check(context,checkNotNull(checked.speech),reduced.startSample)
+  val reducedSpeech=checkNotNull(checked.speech)
+  val reducedWindows=if(profileId!=null)VoiceContinuityGate.SharedWindows(reducedSpeech) else null
+  val gate=VoiceContinuityGate.check(context,reducedSpeech,reduced.startSample,reducedWindows)
   gate.evidence.put("edge_rescue",JSONObject(crop.evidence.toString())
    .put("original_start_sample",candidate.startSample).put("original_end_sample",candidate.endSample)
    .put("cropped_start_sample",reduced.startSample).put("cropped_end_sample",reduced.endSample)
@@ -448,7 +453,7 @@ object VoiceLearningStore {
    val conflict="裁边后仍有与所选人物相反的声纹证据"
    return Assessment(null,conflict,VoiceLearningDiagnostic.failure("target_conflict",conflict,gate.evidence,profileId))
   }
-  return Assessment(Admission(reduced,checked,gate),gate.reason)
+  return Assessment(Admission(reduced,checked,gate,reducedWindows),gate.reason)
  }
  private fun embeddings(context:Context,speech:FloatArray):JSONObject {
   val out=JSONObject()
@@ -521,6 +526,7 @@ object VoiceLearningStore {
  private fun collectCandidateInternal(context:Context,candidate:SpeechEvidence.PureCandidate,title:String,
                                       suggestedProfileId:String?,allowPreviouslyIgnored:Boolean,scope:SpanScope?,collectionRunId:String?,guard:AutoLearningRunGuard?,retryParentId:String?):CandidateInfo? {
   val where=checkedOrigin(candidate.source,candidate.startSample,candidate.endSample)
+  val deferredEdge=scope?.let{SpanningCandidatePlan.coverage(where.startSample,where.endSample,it.rows)?.any{piece->piece.row.deferredEdge}}==true
   var retryParentSnapshot:String?=null
    val snapshot=synchronized(lock){
    val state=load(context)
@@ -541,6 +547,7 @@ object VoiceLearningStore {
    return null
   }
   val selected=admission.candidate;val checked=admission.quality;val consistent=admission.gate
+  if(deferredEdge&&consistent.evidence.has("edge_rescue"))return null
   val selectedWhere=checkedOrigin(selected.source,selected.startSample,selected.endSample)
   // Recompute row intersections after quality/boundary trimming. The UI must
   // describe exactly the saved audio interval, not the longer proposed range.
@@ -815,7 +822,8 @@ object VoiceLearningStore {
   if(automatic)require(isEnabledNow()){"自动学习已关闭，候选保留待确认"}
   val fresh=withIdentitySnapshot(context,prepared.identity){snapshotContext->
    active()
-   val result=VoiceContinuityGate.check(snapshotContext,prepared.waveform,prepared.sourceStart)
+   val sharedWindows=VoiceContinuityGate.SharedWindows(prepared.waveform)
+   val result=VoiceContinuityGate.check(snapshotContext,prepared.waveform,prepared.sourceStart,sharedWindows)
    fun reject(stage:String,reason:String,evidence:JSONObject):Nothing {
     if(automatic)throw VoiceLearningRejection(VoiceLearningDiagnostic.failure(stage,reason,evidence,profileId),reason)
     throw IllegalArgumentException(reason)
@@ -823,9 +831,10 @@ object VoiceLearningStore {
    if(!result.accepted)reject("continuity","候选重新检查未通过：${result.reason}",result.evidence)
    if(automatic&&result.evidence.optString("status")!="review_required")reject("continuity","轨内一致性不足，候选保留人工确认",result.evidence)
    if(!VoiceContinuityGate.targetCompatible(result.evidence,profileId))reject("target_conflict","该片段有与所选人物相反的声纹证据，无法纳入学习",result.evidence)
-   val anchor=VoiceContinuityGate.initialAnchorSupport(snapshotContext,prepared.waveform,profileId,prepared.sourceStart)
+   val anchor=VoiceContinuityGate.initialAnchorSupport(snapshotContext,prepared.waveform,profileId,prepared.sourceStart,sharedWindows)
    if(!anchor.accepted)reject("anchor",anchor.reason,anchor.evidence)
-   val strict=if(automatic)VoiceContinuityGate.automaticAnchorSupport(snapshotContext,prepared.waveform,profileId,prepared.sourceStart,prepared.parent!=null) else null
+   val strict=if(automatic)VoiceContinuityGate.automaticAnchorSupport(snapshotContext,prepared.waveform,profileId,
+    prepared.sourceStart,prepared.parent!=null,sharedWindows) else null
    if(strict!=null&&!strict.accepted)reject("automatic",strict.reason,strict.evidence)
    Triple(result.evidence,anchor.evidence,strict?.evidence)
   }
@@ -872,7 +881,8 @@ object VoiceLearningStore {
    for(candidate in SpeechEvidence.extractPureCandidates(samples,evidence).sortedByDescending{it.endSample-it.startSample}){
     val assessment=assess(frozenContext,candidate,profileId);lastReason=assessment.reason
     val admission=assessment.admission?:continue
-    val anchor=VoiceContinuityGate.initialAnchorSupport(frozenContext,checkNotNull(admission.quality.speech),profileId,admission.candidate.startSample)
+    val anchor=VoiceContinuityGate.initialAnchorSupport(frozenContext,checkNotNull(admission.quality.speech),profileId,
+     admission.candidate.startSample,admission.sharedWindows)
     if(!anchor.accepted){lastReason=anchor.reason;continue}
     accepted=admission to anchor.evidence;break
    }

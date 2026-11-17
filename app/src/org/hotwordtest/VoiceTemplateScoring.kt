@@ -10,11 +10,21 @@ internal object VoiceTemplateScoring {
  }
  fun score(query:FloatArray,initial:FloatArray,supplements:List<FloatArray>):Score? {
   val anchor=cosine(query,initial)?:return null
-  val scores=supplements.mapNotNull{cosine(query,it)}.sortedDescending()
+  var best=Double.NEGATIVE_INFINITY
+  var second=Double.NEGATIVE_INFINITY
+  var count=0
+  for(supplement in supplements){
+   val score=cosine(query,supplement)?:continue
+   count++
+   if(java.lang.Double.compare(score,best)>0){
+    second=best
+    best=score
+   }else if(java.lang.Double.compare(score,second)>0)second=score
+  }
   // Keep the single-supplement estimate when more templates are added. Otherwise a
   // weaker second template can undo a match that the first template already made.
-  val one=if(scores.isNotEmpty())scores[0]*0.85+anchor*0.15 else anchor
-  val two=if(scores.size>=2)scores[0]*0.70+scores[1]*0.30 else anchor
-  return Score(maxOf(anchor,one,two),anchor,scores.size)
+  val one=if(count>0)best*0.85+anchor*0.15 else anchor
+  val two=if(count>=2)best*0.70+second*0.30 else anchor
+  return Score(maxOf(anchor,one,two),anchor,count)
  }
 }

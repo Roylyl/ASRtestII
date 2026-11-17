@@ -1038,13 +1038,20 @@ class MainActivity:Activity(){
       sampleCount=samples.size
       nextStart+=samples.size
       if(!startRequested)throw InterruptedException("已停止")
-      val sourceIdentity=if(zipOrdinal!=null)FileSourceIdentity.zipEntry(uri.toString(),zipOrdinal,label) else FileSourceIdentity.singleFile(uri.toString())
+      val location=if(zipOrdinal!=null)FileSourceIdentity.zipEntry(uri.toString(),zipOrdinal,label) else FileSourceIdentity.singleFile(uri.toString())
+      val sourceIdentity=if(useSpeaker&&!probe)FileSourceIdentity.recording(location,samples){!startRequested} else location
       if(useTurns){
        val data=aligned!!.process(samples,cancelled={!startRequested},progress=progress,source=sourceIdentity).put("mode","speaker_turns")
         .put("transcript_scope","speaker_turns_only").put("speaker_decision_config",speakerDecisionJson(decisionConfig))
        val pure=aligned!!.takeLearningCandidates();val unresolved=aligned!!.takeUnresolvedLearningCandidates()
-       if(!probe){learningRun?.collectPrioritized(data.getJSONArray("speaker_turn_transcripts"),pure,unresolved,sourceIdentity,label,offset)
-        learningRun?.collectFileSpanning(data.getJSONArray("speaker_turn_transcripts"),pure,unresolved,sourceIdentity,label,offset)}
+       if(!probe){
+        val turns=data.getJSONArray("speaker_turn_transcripts")
+        learningRun?.collectPrioritized(turns,pure,unresolved,sourceIdentity,label,offset)
+        learningRun?.collectFileSpanning(turns,pure,unresolved,sourceIdentity,label,offset)
+        data.optJSONObject("raw_speech_activity")?.let{activity->
+         data.put("speaker_turn_transcripts",ShortAnswerDisplayReview.apply(assets,decisionConfig,samples,activity,turns){!startRequested})
+        }
+       }
        data
       }else if(useVad){
        val recognizer=checkNotNull(engine)
@@ -1072,8 +1079,13 @@ class MainActivity:Activity(){
         })
        val data=outcome.json().put("segments",fileSegments).put("mode","vad_segments")
         .put("decoding",if(hot.isEmpty())"greedy_search" else "modified_beam_search")
-       if(!probe&&useSpeaker){learningRun?.collectPrioritized(fileSegments,pure,unresolved,sourceIdentity,label,offset)
-        learningRun?.collectFileSpanning(fileSegments,pure,unresolved,sourceIdentity,label,offset)}
+       if(!probe&&useSpeaker){
+        learningRun?.collectPrioritized(fileSegments,pure,unresolved,sourceIdentity,label,offset)
+        learningRun?.collectFileSpanning(fileSegments,pure,unresolved,sourceIdentity,label,offset)
+        if(fileSegments.length()>0)basicVoice?.activityEvidence(sourceIdentity)?.let{activity->
+         data.put("segments",ShortAnswerDisplayReview.apply(assets,decisionConfig,samples,activity,fileSegments){!startRequested})
+        }
+       }
        if(useSpeaker)data.put("speaker_decision_config",speakerDecisionJson(decisionConfig))
         .put("speaker_status","experimental_segment_assignment").put("speaker_model",SpeakerModels.name(speakerKey))
         .put("speaker_threshold_status","uncalibrated")

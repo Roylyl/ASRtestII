@@ -19,8 +19,10 @@ class LocalSpeakerTracker(assets: AssetManager, modelKey: String = SpeakerModels
  private val groups=SpeakerEvidenceGroups(extractor.dim(),decisionConfig)
  internal var evidenceObserver:((FloatArray,JSONObject)->Unit)?=null
  val dimension:Int get()=extractor.dim()
- fun embedding(samples:FloatArray):FloatArray? {
-  if(samples.size<16000||samples.any{!it.isFinite()})return null
+ fun embedding(samples:FloatArray):FloatArray? = embedding(samples,16000)
+ internal fun reviewShortEmbedding(samples:FloatArray):FloatArray? = embedding(samples,7200)
+ private fun embedding(samples:FloatArray,minSamples:Int):FloatArray? {
+  if(samples.size<minSamples||samples.any{!it.isFinite()})return null
   val rms=sqrt(samples.sumOf{it.toDouble()*it}/samples.size);if(rms<0.003)return null
   val stream=extractor.createStream()
   try{
@@ -34,6 +36,12 @@ class LocalSpeakerTracker(assets: AssetManager, modelKey: String = SpeakerModels
  fun snapshot():org.json.JSONArray=groups.snapshot()
  fun restore(saved:org.json.JSONArray)=groups.restore(saved)
  fun resolvePending(pendingKey:String?):String?=groups.resolved(pendingKey)
+
+ internal fun observeShort(vector:FloatArray,support:SpeakerEvidenceGroups.Support):JSONObject =
+  groups.observeShort(vector,support)
+
+ internal fun verifyShortWindow(vector:FloatArray,support:SpeakerEvidenceGroups.Support,targetId:String):JSONObject =
+  groups.verifyShortWindow(vector,support,targetId)
  /** Test observer sees the same three-second windows even when an enrolled identity takes precedence. */
  internal fun traceRegisteredPure(candidate:SpeechEvidence.PureCandidate,identity:JSONObject,cachedVector:FloatArray?=null){
   val observer=evidenceObserver?:return

@@ -29,6 +29,44 @@ internal object VoiceContinuityGate {
  data class Result(val accepted:Boolean,val evidence:JSONObject,val reason:String)
  data class Trim(val start:Int,val end:Int,val evidence:JSONObject)
 
+ /** One candidate confirmation owns this PCM snapshot and its acoustic vectors.
+  * Identity scores are deliberately recomputed by each caller's matcher. */
+ internal class SharedWindows(private val input:FloatArray) {
+  private data class Key(val model:String,val start:Int,val end:Int)
+  private val pcm=input.copyOf()
+  private val vectors=LinkedHashMap<Key,FloatArray>(64,0.75f,true)
+
+  fun verifyInput(samples:FloatArray){check(input===samples){"声纹复用范围与当前候选不一致"}}
+  fun embedding(model:String,start:Int,end:Int,extract:(FloatArray)->FloatArray?):FloatArray? {
+   active()
+   val key=Key(model,start,end)
+   vectors[key]?.let{return it}
+   val value=extract(pcm.copyOfRange(start,end))?:return null
+   vectors[key]=value
+   if(vectors.size>64)vectors.remove(vectors.keys.first())
+   return value
+  }
+ }
+
+ private class WindowReader(val read:(Int,Int)->FloatArray?,private val release:()->Unit):AutoCloseable {
+  override fun close()=release()
+ }
+
+ private fun openWindows(context:Context,samples:FloatArray,model:String,shared:SharedWindows?):WindowReader {
+  if(shared!=null){
+   shared.verifyInput(samples)
+   var tracker:LocalSpeakerTracker?=null
+   return WindowReader({start,end->
+    shared.embedding(model,start,end){pcm->
+     val extractor=tracker?:LocalSpeakerTracker(context.assets,model).also{tracker=it}
+     extractor.embedding(pcm)
+    }
+   },{tracker?.close()})
+  }
+  val tracker=LocalSpeakerTracker(context.assets,model)
+  return WindowReader({start,end->tracker.embedding(samples.copyOfRange(start,end))},tracker::close)
+ }
+
  /** Diagnose a rejected candidate with one continuous Silero stream. Only remove a
   * low-speech edge, preserve 100ms of context, and never splice interior audio. */
  fun lowSpeechTrim(context:Context,samples:FloatArray):Trim? {
@@ -73,7 +111,9 @@ internal object VoiceContinuityGate {
   return Trim(cropStart,cropEnd,info)
  }
 
- fun check(context:Context,samples:FloatArray,sourceStart:Long=0L):Result {
+ fun check(context:Context,samples:FloatArray,sourceStart:Long=0L):Result = check(context,samples,sourceStart,null)
+
+ fun check(context:Context,samples:FloatArray,sourceStart:Long,shared:SharedWindows?):Result {
   active()
   val result=JSONObject().put("version",VERSION).put("method","independent_1500ms_embedding_consistency")
    .put("status","feature_unavailable").put("conclusion","experimental_not_single_speaker_proof")
@@ -93,7 +133,7 @@ internal object VoiceContinuityGate {
    val modelInfo=JSONObject().put("name",SpeakerModels.name(model));records.put(model,modelInfo)
    val windows=JSONArray();modelInfo.put("windows",windows)
    val vectors=mutableListOf<FloatArray>()
-   val tracker=try{LocalSpeakerTracker(context.assets,model)}catch(e:Exception){
+   val tracker=try{openWindows(context,samples,model,shared)}catch(e:Exception){
     if(e is java.util.concurrent.CancellationException)throw e
     modelInfo.put("error",e.message?:e.javaClass.simpleName)
     return Result(false,result,"声纹模型不可用，无法检查轨内一致性")
@@ -102,7 +142,7 @@ internal object VoiceContinuityGate {
     WearerVoiceStore.Matcher(context,model,loadExtractor=false).use{matcher->
      for((i,range) in ranges.withIndex()){
       active()
-      val vec=tracker.embedding(samples.copyOfRange(range.first,range.second))
+      val vec=tracker.read(range.first,range.second)
       val independent=i==0||range.first>=ranges[i-1].second
       val row=JSONObject().put("start_sample",sourceStart+range.first).put("end_sample",sourceStart+range.second)
        .put("independent",independent)
@@ -154,7 +194,10 @@ internal object VoiceContinuityGate {
 
  /** Experimental enrollment guard: require independent windows to support the selected
   * person's immutable initial templates. Normal recognition thresholds are not changed. */
- fun initialAnchorSupport(context:Context,samples:FloatArray,profileId:String,sourceStart:Long=0L):Result {
+ fun initialAnchorSupport(context:Context,samples:FloatArray,profileId:String,sourceStart:Long=0L):Result =
+  initialAnchorSupport(context,samples,profileId,sourceStart,null)
+
+ fun initialAnchorSupport(context:Context,samples:FloatArray,profileId:String,sourceStart:Long,shared:SharedWindows?):Result {
   active()
   val evidence=JSONObject().put("version",1).put("method","independent_windows_initial_templates_only")
    .put("experimental",true).put("profile_id",profileId).put("window_samples",WINDOW)
@@ -171,7 +214,7 @@ internal object VoiceContinuityGate {
    val info=JSONObject().put("model",SpeakerModels.name(model)).put("minimum_score",minimumScore).put("windows",JSONArray());models.put(model,info)
    if(!WearerVoiceStore.hasInitialTemplate(context,profileId,model))
     return Result(false,evidence.put("status","initial_template_missing"),"该声纹缺少${SpeakerModels.name(model)}初始模板，请先在声纹管理中补录以支持两种模型")
-   val extractor=try{LocalSpeakerTracker(context.assets,model)}catch(e:Exception){
+   val extractor=try{openWindows(context,samples,model,shared)}catch(e:Exception){
     if(e is java.util.concurrent.CancellationException)throw e
     return Result(false,evidence.put("status","model_unavailable"),"无法校验初始声纹，请稍后重试")
    }
@@ -182,7 +225,7 @@ internal object VoiceContinuityGate {
      while(pos+WINDOW<=samples.size){
       active();val row=JSONObject().put("start_sample",sourceStart+pos).put("end_sample",sourceStart+pos+WINDOW).put("independent",true)
       info.getJSONArray("windows").put(row)
-      val vector=extractor.embedding(samples.copyOfRange(pos,pos+WINDOW))
+      val vector=extractor.read(pos,pos+WINDOW)
       if(vector==null)row.put("status","feature_unavailable") else {
        val match=matcher.identifyEmbedding(vector,WINDOW,true);row.put("match",match)
        val hit=match.optString("status")=="wearer_candidate"&&match.optString("profile_id")==profileId
@@ -206,7 +249,10 @@ internal object VoiceContinuityGate {
 
  /** All windows must independently agree with the immutable initial template.
   * The final overlapping tail is also checked, but not counted as independent. */
- @JvmOverloads fun automaticAnchorSupport(context:Context,samples:FloatArray,profileId:String,sourceStart:Long=0L,requireCompetitor:Boolean=false):Result {
+ @JvmOverloads fun automaticAnchorSupport(context:Context,samples:FloatArray,profileId:String,sourceStart:Long=0L,requireCompetitor:Boolean=false):Result =
+  automaticAnchorSupport(context,samples,profileId,sourceStart,requireCompetitor,null)
+
+ fun automaticAnchorSupport(context:Context,samples:FloatArray,profileId:String,sourceStart:Long,requireCompetitor:Boolean,shared:SharedWindows?):Result {
   active()
   val evidence=JSONObject().put("version",1).put("method","strict_initial_template_all_windows")
    .put("experimental",true).put("minimum_similarity",AUTO_INITIAL_MIN).put("minimum_margin",AUTO_MARGIN)
@@ -224,7 +270,7 @@ internal object VoiceContinuityGate {
    active();val info=JSONObject().put("model",SpeakerModels.name(model)).put("windows",JSONArray());models.put(model,info)
    if(!WearerVoiceStore.hasInitialTemplate(context,profileId,model))
     return Result(false,evidence.put("status","initial_template_missing"),"自动学习需要两种模型的初始声纹")
-   val tracker=try{LocalSpeakerTracker(context.assets,model)}catch(e:Exception){
+   val tracker=try{openWindows(context,samples,model,shared)}catch(e:Exception){
     if(e is java.util.concurrent.CancellationException)throw e
     return Result(false,evidence.put("status","model_unavailable"),"自动校验模型不可用")
    }
@@ -232,7 +278,7 @@ internal object VoiceContinuityGate {
     WearerVoiceStore.Matcher(context,model,loadExtractor=false,initialOnly=true,acceptanceThreshold=AUTO_INITIAL_MIN,identityMargin=AUTO_MARGIN).use{matcher->
      var independent=0
      for((i,range) in ranges.withIndex()){
-      active();val vector=tracker.embedding(samples.copyOfRange(range.first,range.second))
+      active();val vector=tracker.read(range.first,range.second)
       val match=matcher.identifyEmbedding(vector,WINDOW,true)
       val disjoint=i==0||range.first>=ranges[i-1].second
       if(disjoint)independent++

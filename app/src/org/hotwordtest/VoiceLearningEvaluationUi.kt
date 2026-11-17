@@ -247,7 +247,8 @@ class VoiceLearningEvaluationUi(
    require(begin<samples.size && begin+count<=samples.size){"所选区间超出文件时长，请缩短或调整起点"}
    val segment=samples.copyOfRange(begin.toInt(),(begin+count).toInt())
    val range=String.format(java.util.Locale.ROOT," [%.1f–%.1f秒]",start,start+length)
-   val saved=VoiceLearningEvaluation.add(activity.applicationContext,id,self,source,title+range,begin,segment)
+   val recording=FileSourceIdentity.recording(source,samples){discard}
+   val saved=VoiceLearningEvaluation.add(activity.applicationContext,id,self,recording,title+range,begin,segment)
    if(saved.status=="quality_rejected")"已记录未通过门控的样本："+saved.reason else "已加入"+(if(self)"本人" else "他人")+"验证样本"
   }
  }

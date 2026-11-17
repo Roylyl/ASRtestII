@@ -294,7 +294,8 @@ internal class VoiceLearningRun @JvmOverloads constructor(private val context:Co
    val method=item.optJSONObject("speaker_identity_provenance")?.optString("method").orEmpty()
    val id=(item.opt("stable_speaker_id") as? String)?.takeIf{it.isNotBlank()}
    rows.add(SpanningCandidatePlan.Row(start,end,item.optString("text"),id,
-    explicitOverlap(item,"speaker_display")||method=="conflicting_voice_evidence"))
+    explicitOverlap(item,"speaker_display")||method=="conflicting_voice_evidence",
+    id==null&&method=="awaiting_independent_voice_windows"))
   }
   val available=LearningCandidateSequence.order(known.filter{it.source==source},unresolved.filter{it.source==source},
    {it.source+"|"+it.startSample+"|"+it.endSample},{it.endSample-it.startSample})

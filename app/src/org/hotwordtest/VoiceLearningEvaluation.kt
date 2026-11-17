@@ -90,8 +90,8 @@ object VoiceLearningEvaluation {
  private fun origins(context:Context):List<VoiceLearningStore.Origin> =
   WearerVoiceStore.listProfiles(context).flatMap{VoiceLearningStore.activeOrigins(context,it.id)}+
    VoiceLearningStore.listCandidates(context).map{VoiceLearningStore.Origin(it.source,it.startSample,it.endSample)}
- private fun overlaps(origins:List<VoiceLearningStore.Origin>,source:String,start:Long,end:Long)=
-  origins.any{it.source==source && it.startSample<end && it.endSample>start}
+ private fun usedForLearning(origins:List<VoiceLearningStore.Origin>,source:String)=
+  origins.any{FileSourceIdentity.sameForDedup(it.source,source)}
  private fun templateState(context:Context):List<String> = WearerVoiceStore.listProfiles(context).flatMap{profile->
   listOf(profile.id+":"+profile.models.sorted().joinToString(","))+
    VoiceLearningStore.listSamples(context,profile.id).map{profile.id+":"+it.id}
@@ -103,8 +103,8 @@ object VoiceLearningEvaluation {
   require(samples.size in RATE*3..RATE*30){"验证段须为3～30秒，请选择单人独立发言"}
   require(startSample>=0 && source.isNotBlank()){"验证来源无效"}
   val end=startSample+samples.size
-  require(!overlaps(origins(context),source,startSample,end)){
-   "这段音频已进入学习候选或补充声纹，请换一段独立验证录音"
+  require(!usedForLearning(origins(context),source)){
+   "这份录音已产生学习候选或补充声纹，请换一份独立录音"
   }
   val started=android.os.SystemClock.elapsedRealtime()
   val evidence=SpeechEvidence.analyze(context,samples,source,startSample,false)
@@ -133,14 +133,16 @@ object VoiceLearningEvaluation {
   return synchronized(this){
    val data=read(context);noPendingDeletion(data,profileId)
    require(WearerVoiceStore.listProfiles(context).any{it.id==profileId}){"目标声纹已删除，验证样本未保存"}
-   require(!overlaps(origins(context),source,startSample,end)){
-    "保存前发现该音频已进入学习候选或补充声纹，请换一段独立录音"
+   require(!usedForLearning(origins(context),source)){
+    "保存前发现这份录音已产生学习候选或补充声纹，请换一份独立录音"
    }
    val rows=data.getJSONArray("cases")
    require(rows.length()<MAX_CASES){"验证集已满，请先删除旧验证样本"}
    for(i in 0 until rows.length()){
-    val old=parse(rows.getJSONObject(i))
-    require(old.profileId!=profileId || old.source!=source || old.startSample>=end || old.endSample<=startSample){
+    val old=rows.getJSONObject(i)
+    val oldStart=old.optLong("requested_start_sample",old.getLong("start_sample"))
+    val oldEnd=old.optLong("requested_end_sample",old.getLong("end_sample"))
+    require(old.getString("profile_id")!=profileId || !FileSourceIdentity.sameForDedup(old.getString("source"),source) || oldStart>=end || oldEnd<=startSample){
      "验证集已包含该来源的重叠片段，请勿重复加入"
     }
    }
@@ -174,11 +176,13 @@ object VoiceLearningEvaluation {
      val row=JSONObject().put("id",item.id).put("title",item.title)
       .put("expected",if(item.self)"self" else "other").put("target_profile_id",profileId)
      val vector=item.vectors[model]
-     if(item.status=="quality_rejected"){
+     if(usedForLearning(trained,item.source)){
+      excluded++;row.put("status","excluded").put("reason","整份来源录音已产生学习候选或补充声纹")
+     }else if(item.status=="quality_rejected"){
       if(item.self)rejectedOwn++ else rejectedOther++
       row.put("status","quality_rejected").put("reason",item.reason)
-     }else if(vector==null || overlaps(trained,item.source,item.startSample,item.endSample)){
-      excluded++;row.put("status","excluded").put("reason",if(vector==null)"该模型缺少验证特征" else "该来源区间已进入学习候选或补充声纹")
+     }else if(vector==null){
+      excluded++;row.put("status","excluded").put("reason","该模型缺少验证特征")
      }else{
       val count=(item.speechSeconds*RATE).toInt()
       val base=initial.identifyEmbedding(vector,count,true)
@@ -203,11 +207,11 @@ object VoiceLearningEvaluation {
    .put("own_trials",own).put("other_trials",others).put("excluded",excluded)
    .put("reference_own_trials",cases.count{it.self}).put("reference_other_trials",cases.count{!it.self})
    .put("quality_rejected_own",rejectedOwn).put("quality_rejected_other",rejectedOther)
-   .put("quality_accepted_trials",own+others)
+   .put("quality_accepted_trials",own+others).put("total_trials",cases.size)
    .put("initial_misses",beforeMiss).put("learned_misses",afterMiss)
    .put("initial_false_accepts",beforeFalse).put("learned_false_accepts",afterFalse)
    .put("process_ms",android.os.SystemClock.elapsedRealtime()-started).put("trials",trials)
-   .put("note","身份分类指标仅以通过质量门控的独立样本为分母，不是端到端准确率；质量拒绝单列，不能视为识别正确。本人拒绝含未确定和匹配到其他人物；两种配置使用相同向量和阈值。来源区间进入学习则排除。")
+   .put("note","身份分类指标以通过质量门控的独立样本为分母；质量拒绝单列，不计为识别正确。本人漏认含未确定和匹配到其他人物；两种配置使用相同向量和阈值。整份来源录音产生学习候选或补充声纹则排除。")
   synchronized(this){
    val data=read(context);noPendingDeletion(data,profileId)
    require(WearerVoiceStore.listProfiles(context).any{it.id==profileId}){"目标声纹已删除，验证结果未保存"}
@@ -230,6 +234,8 @@ object VoiceLearningEvaluation {
    .append(result.optInt("quality_rejected_other")).append("条；以下比例仅针对通过门控的独立样本。\n")
   fun rate(n:Int,total:Int)=if(total==0)"未添加验证样本" else "$n/$total（"+String.format(java.util.Locale.ROOT,"%.1f",n*100.0/total)+"%）"
   val own=result.getInt("own_trials");val other=result.getInt("other_trials")
+  val total=result.optInt("total_trials",own+other+result.optInt("excluded")+result.optInt("quality_rejected_own")+result.optInt("quality_rejected_other"))
+  append("进入身份评分的样本：").append(rate(own+other,total)).append('\n')
   append("\n本人漏认\n初始模板：").append(rate(result.getInt("initial_misses"),own))
   append("\n补充后：").append(rate(result.getInt("learned_misses"),own))
   append("\n\n他人误认\n初始模板：").append(rate(result.getInt("initial_false_accepts"),other))

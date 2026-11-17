@@ -6,7 +6,7 @@
 <p align="center">在Android手机上离线转写中英文录音，管理和持续补充声纹，按时间与说话人阅读对话。</p>
 
 <p align="center">
-  <a href="./app/AndroidManifest.xml"><img src="https://img.shields.io/badge/version-2.0.1-2563eb?style=flat-square" alt="源码版本2.0.1"></a>
+  <a href="./app/AndroidManifest.xml"><img src="https://img.shields.io/badge/version-2.0.2-2563eb?style=flat-square" alt="源码版本2.0.2"></a>
   <a href="#安装与快速开始"><img src="https://img.shields.io/badge/Android-8.0%2B-27754d?style=flat-square&amp;logo=android&amp;logoColor=white" alt="Android 8.0及以上"></a>
   <a href="#安装与快速开始"><img src="https://img.shields.io/badge/ABI-arm64--v8a-526479?style=flat-square" alt="arm64-v8a架构"></a>
   <a href="#许可证与第三方声明"><img src="https://img.shields.io/badge/Code%20license-Apache--2.0-485d75?style=flat-square" alt="项目原创代码采用Apache-2.0"></a>
@@ -97,6 +97,8 @@ ZIP中的WAV按文件名排序，每条录音独立处理并刷新尾部。界�
 
 长文件先显示当前句的即时预览，再逐步显示分人结果。完成后，结果区保留“[起止时间]说话人：内容”的形式。导入过程会在应用专属目录的`runs`中保存文字与结构化结果。
 
+文件分人完成后，应用会用同一录音中其他独立发言复核待定的短接话。半秒级短答还须在错开的活动分析窗中与同一人物的参照连上，并避开换人边界和重叠。证据足够时只回填有支持的显示区间，无需预先登记；其余区间继续保留待定。
+
 需要整理摘要时，可以继续使用本次结果；已经有勘误稿时，也能点击“打开已有勘误稿”，选择1MiB以内的UTF-8文本，再直接生成摘要。稿件每行须采用上面的时间区间、说话人和全角冒号格式。
 
 ## 热词词包与权重
@@ -144,7 +146,9 @@ ZIP中的WAV按文件名排序，每条录音独立处理并刷新尾部。界�
 
 每人最多保存24条补充模板。未通过确认的候选尚不参与人物匹配；可在“待确认学习片段”中查看、试听或丢弃。候选试听与实际学习使用同一段纯净音频，转为正式模板或丢弃后移除候选音频。补充模板保存声纹特征及来源信息，不长期保留试听录音。
 
-模板增加不等于每次都提高准确率。“学习→学习前后本地对照”可添加另外录制的本人和他人语音，比较初始模板与包含补充模板的识别结果，帮助决定是否保留某次补充。
+同一段连续单人语音跨越多行转写时，仍可在通过声学检查后保存为待确认候选。短接话复核只更新转写显示，学习仍使用原始候选证据。确认候选与补录时会复用同一语音窗的声纹向量，减少重复计算。
+
+“学习→学习前后本地对照”可添加另外录制的本人和他人语音，比较初始模板与包含补充模板的识别结果，帮助决定是否保留某次补充。应用按录音内容识别同源文件，在计分时排除参与学习的录音。
 
 ## 云端勘误与总体摘要
 
@@ -240,7 +244,7 @@ git lfs pull
 pwsh -File .\Build-Apk.ps1 -JdkHome "C:\path\to\jdk-21" -Unsigned
 ```
 
-当前源码的`versionName`为`2.0.1`，`versionCode`为`2000002`。将示例中的JDK路径改成实际安装目录；未签名安装包默认输出到Windows桌面，文件名为`ASRtestII-2.0.1-unsigned.apk`，签名后才能安装。使用自己的Android签名密钥直接构建可安装APK时，指定密钥库和别名，按提示输入密码。
+当前源码的`versionName`为`2.0.2`，`versionCode`为`2000003`。将示例中的JDK路径改成实际安装目录；未签名安装包默认输出到Windows桌面，文件名为`ASRtestII-2.0.2-unsigned.apk`，签名后才能安装。使用自己的Android签名密钥直接构建可安装APK时，指定密钥库和别名，按提示输入密码。
 
 ```powershell
 pwsh -File .\Build-Apk.ps1 -JdkHome "C:\path\to\jdk-21" -Keystore "D:\keys\release.p12" -KeyAlias "release"
@@ -266,7 +270,7 @@ pwsh -File .\Build-Apk.ps1 -JdkHome "C:\path\to\jdk-21" -Keystore "D:\keys\relea
 <summary>维护者发布新版本</summary>
 
 1. 更新[AndroidManifest.xml](./app/AndroidManifest.xml)中的`versionName`，同时递增`versionCode`。
-2. 用原发行证书构建签名APK，使附件名与版本一致。例如`versionName=2.0.1`时，附件名为`ASRtestII-2.0.1.apk`。
+2. 用原发行证书构建签名APK，使附件名与版本一致。例如`versionName=2.0.2`时，附件名为`ASRtestII-2.0.2.apk`。
 3. 在GitHub创建对应版本标签的正式Release，上传APK并填写更新说明。应用按三段版本号比较更新，跳过草稿和预发布版。
 
 </details>

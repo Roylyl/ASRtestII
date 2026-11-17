@@ -13,12 +13,15 @@ class StableSpeakerAssignments(
 ):AutoCloseable {
  private data class Window(val source:String,val start:Long,val end:Long,val track:String,
                            val proof:JSONObject,val voice:JSONObject,val identity:JSONObject)
+ private data class ShortObservation(val window:Window,val support:SpeakerEvidenceGroups.Support,
+                                    val pcm:FloatArray?,val verified:List<Window> = emptyList())
  private data class Raw(val source:String,val json:JSONObject)
  private data class Person(val key:String,val label:String,val profile:String?=null)
  private val tracker=LocalSpeakerTracker(assets,modelKey,decisionConfig=decisionConfig)
  private val analyzer=SpeechEvidence.Analyzer(context)
  private val matcher=WearerVoiceStore.Matcher(context,modelKey,loadExtractor=false)
  private val windows=linkedMapOf<String,Window>()
+ private val shortWindows=linkedMapOf<String,ShortObservation>()
  private val raw=linkedMapOf<String,Raw>()
  private val observedCandidates=mutableSetOf<String>()
  private val refinementMetrics=mutableMapOf<String,JSONObject>()
@@ -47,6 +50,7 @@ class StableSpeakerAssignments(
   fun trace(row:JSONObject){if(debug.length()<2048)debug.put(row) else dropped++}
   val saved=tracker.snapshot()
   val staged=linkedMapOf<String,Window>();val observedRaw=linkedMapOf<String,Raw>();val learning=mutableListOf<SpeechEvidence.PureCandidate>()
+  val shortStaged=linkedMapOf<String,ShortObservation>()
   val unresolved=mutableListOf<SpeechEvidence.PureCandidate>()
   val completedCandidates=mutableSetOf<String>();val events=mutableListOf<Pair<FloatArray,JSONObject>>()
   val conflictedTracks=mutableSetOf<String>()
@@ -230,6 +234,7 @@ class StableSpeakerAssignments(
     // exclusive interval separately: a local track is not a persistent speaker identity.
     // No waveform from these shorter intervals can become a learning template.
     val activityRows=document.getJSONArray("activities")
+    var shortProbeCount=0
     for(speech in proof.recognitionSpeech()){
      if(speech.localTrack in conflictedTracks)continue
      val individualRanges=mutableListOf<Pair<Long,Long>>()
@@ -238,7 +243,44 @@ class StableSpeakerAssignments(
       if(activity.getString("local_track")!=speech.localTrack)continue
       val begin=maxOf(range.first,activity.getLong("start_sample"))
       val end=minOf(range.second,activity.getLong("end_sample"))
-      if(end>begin)individualRanges.add(begin to end)
+      if(end<=begin)continue
+      individualRanges.add(begin to end)
+      // Probe a whole short activity or the separated ends of a longer activity. A crop
+      // from the same raw activity shares its original evidence key and cannot add a vote.
+      val span=end-begin
+      if(span<24000L)continue
+      val familyStart=activity.getLong("start_sample");val familyEnd=activity.getLong("end_sample")
+      val family="$familyStart:$familyEnd"
+      val ranges=when {
+       span==24000L->listOf(begin to end)
+       span<48000L->listOf(begin to end,end-24000L to end)
+       else->listOf(begin to begin+24000L,end-24000L to end)
+      }
+      for((left,right) in ranges){
+       if(shortProbeCount>=24)break
+       val shortKey="$source|short|$left:$right"
+       if(shortKey in shortWindows||shortKey in shortStaged)continue
+       if((windows.values+staged.values).any{w->w.source==source&&w.start<right&&w.end>left&&person(w)?.profile!=null})continue
+       val a=(left-proof.startSample).toInt();val b=(right-proof.startSample).toInt()
+       val audio=wave.copyOfRange(a,b)
+       if(audio.count{kotlin.math.abs(it)>=0.995f}.toDouble()/audio.size>0.01)continue
+       shortProbeCount++
+       val vector=tracker.embedding(audio)?:continue
+       val identity=matcher.identifyEmbedding(vector,audio.size,true)
+       if(identity.optString("status")=="wearer_candidate")continue
+       val provenance=speech.evidenceJson().put("kind","recognition_only_short_recurrence")
+        .put("start_sample",left).put("end_sample",right)
+        .put("source_intervals",JSONArray().put(JSONObject().put("start_sample",left).put("end_sample",right)))
+       val support=SpeakerEvidenceGroups.Support(source,left,right,family,
+        provenance.getLong("analysis_window_start"),provenance.getLong("analysis_window_end"),speech.localTrack,familyStart,familyEnd)
+       val voice=tracker.observeShort(vector,support)
+       trace(JSONObject().put("kind","short_recurrence_probe").put("source",source).put("local_track",speech.localTrack)
+        .put("start_sample",left).put("end_sample",right).put("learning_allowed",false).put("grouping",voice))
+       if(voice.opt("pending_key") is String||voice.opt("speaker_id") is String){
+        val window=Window(source,left,right,speech.localTrack,provenance,voice,identity)
+        shortStaged[shortKey]=ShortObservation(window,support,audio)
+       }
+      }
      }
      for(range in individualRanges.sortedBy{it.first}){
       val occupied=(windows.values+staged.values).filter{it.source==source&&it.start<range.second&&it.end>range.first}.sortedBy{it.start}
@@ -271,7 +313,18 @@ class StableSpeakerAssignments(
     }
     offset=end
    }
-   windows.putAll(staged);raw.putAll(observedRaw);observedCandidates.addAll(completedCandidates)
+   val shortPlan=LinkedHashMap(shortWindows)
+   shortPlan.putAll(shortStaged)
+   for((key,item) in shortPlan){
+    val pcm=item.pcm?:continue
+    val group=person(item.window)?.key?.takeIf{it.startsWith("anonymous:")}?.substringAfter(':')?:continue
+    val verified=verifyShortEdges(item,pcm,group,::trace)
+    shortPlan[key]=item.copy(pcm=null,verified=verified)
+   }
+   // Only the recent, bounded recurrence pool needs unresolved PCM across observations.
+   val outdated=shortPlan.entries.filter{it.value.pcm!=null}.dropLast(32)
+   for(entry in outdated)entry.setValue(entry.value.copy(pcm=null))
+   windows.putAll(staged);shortWindows.putAll(shortPlan);raw.putAll(observedRaw);observedCandidates.addAll(completedCandidates)
    val accumulated=refinementDiagnostics.getOrPut(source){JSONArray()}
    for(i in 0 until debug.length()){if(accumulated.length()<2048)accumulated.put(debug.getJSONObject(i)) else dropped++}
    diagnosticsDropped[source]=(diagnosticsDropped[source]?:0)+dropped
@@ -291,6 +344,70 @@ class StableSpeakerAssignments(
   return group?.let{Person("anonymous:"+it,SpeakerTranscript.groupName(it))}
  }
  private fun intersection(a:Long,b:Long,c:Long,d:Long)=(minOf(b,d)-maxOf(a,c)).coerceAtLeast(0)
+
+ private fun verifyShortEdges(observation:ShortObservation,pcm:FloatArray,target:String,
+                              trace:(JSONObject)->Unit):List<Window> {
+  val window=observation.window
+  // A single one-second embedding cannot establish where a change occurs. Publish
+  // the overlap of consecutive passing probes and leave their outer edges unresolved.
+  val probeSize=16000
+  val stride=8000
+  val last=pcm.size-probeSize
+  if(last<0)return emptyList()
+  val starts=((0..last step stride).toList()+last).distinct()
+  val verified=mutableListOf<Window>()
+  var previousCheck:JSONObject?=null
+  var previousSupport:SpeakerEvidenceGroups.Support?=null
+  for(start in starts){
+   if(Thread.currentThread().isInterrupted)throw java.util.concurrent.CancellationException("短语音复核已取消")
+   val support=observation.support.copy(start=window.start+start,end=window.start+start+probeSize)
+   val vector=tracker.embedding(pcm.copyOfRange(start,start+probeSize))
+   val check=vector?.let{tracker.verifyShortWindow(it,support,target)}
+   trace(JSONObject().put("kind","short_edge_verification").put("source",window.source)
+    .put("local_track",window.track).put("start_sample",support.start).put("end_sample",support.end)
+    .put("target_id",target).put("verification",check?:JSONObject.NULL))
+   val prior=previousSupport
+   val priorCheck=previousCheck
+   previousSupport=support
+   previousCheck=check
+   if(prior==null||priorCheck?.optBoolean("verified")!=true||check?.optBoolean("verified")!=true)continue
+   val left=maxOf(support.start,verified.lastOrNull()?.end?:window.start)
+   val right=minOf(support.end,prior.end)
+   if(left>=right)continue
+   val voice=JSONObject().put("speaker_id",target).put("speaker_status","verified_short_edge")
+    .put("recognition_only",true).put("learning_allowed",false).put("short_edge_verified",true)
+    .put("provenance",prior.json()).put("edge_verification",priorCheck).put("adjacent_edge_verification",check)
+   verified.add(window.copy(start=left,end=right,voice=voice))
+  }
+  return verified
+ }
+
+ private fun outputWindows(source:String):List<Window> {
+  var result=windows.values.filter{it.source==source}
+  val observations=shortWindows.values.filter{it.window.source==source}
+   .sortedBy{if(it.verified.isNotEmpty())0 else if(person(it.window)!=null)1 else 2}
+  for(observation in observations){
+   val short=observation.window
+   val covered=result.filter{it.start<short.end&&short.start<it.end}
+   if(covered.any{person(it)?.profile!=null||it.proof.optString("kind")=="recognition_only_short_recurrence"})continue
+   // A conflict can withhold an existing anonymous attribution while recurrence is pending.
+   // Otherwise a pending observation adds no output boundary of its own.
+   if(person(short)==null&&covered.none{person(it)!=null})continue
+   val waiting=short.copy(voice=JSONObject().put("speaker_status","short_boundary_unresolved"))
+   val replacements=mutableListOf<Window>();var cursor=short.start
+   for(piece in observation.verified){
+    if(cursor<piece.start)replacements.add(waiting.copy(start=cursor,end=piece.start))
+    replacements.add(piece);cursor=piece.end
+   }
+   if(cursor<short.end)replacements.add(waiting.copy(start=cursor))
+   result=result.flatMap{old->
+    if(old.start>=short.end||short.start>=old.end)listOf(old)
+    else listOfNotNull(old.copy(end=short.start).takeIf{old.start<short.start},
+     old.copy(start=short.end).takeIf{short.end<old.end})
+   }+replacements
+  }
+  return result
+ }
  private fun intervals(source:String,key:String):List<JSONObject> =
   raw.values.filter{it.source==source}.flatMap{r->val a=r.json.getJSONArray(key);(0 until a.length()).map{a.getJSONObject(it)}}
  private fun rowTracks(source:String,start:Long,end:Long):Set<String> = intervals(source,"activities")
@@ -307,12 +424,13 @@ class StableSpeakerAssignments(
  private fun stable(row:JSONObject):String?=row.optString("stable_speaker_id").takeIf{it.isNotBlank()}
  /** Keep raw evidence for audit; never collapse actual overlap into one track. */
  @Synchronized fun activityEvidence(source:String):JSONObject {
+  val output=outputWindows(source)
   val activity=intervals(source,"activities").distinctBy{it.toString()}
   val overlaps=intervals(source,"predicted_overlap").distinctBy{it.toString()}
   val refined=JSONArray()
   for(row in activity){
    val start=row.getLong("start_sample");val end=row.getLong("end_sample");val track=row.getString("local_track")
-   val supports=windows.values.filter{it.source==source&&it.track==track&&intersection(start,end,it.start,it.end)>0}
+   val supports=output.filter{it.track==track&&intersection(start,end,it.start,it.end)>0}
    val boundaries=(listOf(start,end)+supports.flatMap{listOf(it.start.coerceIn(start,end),it.end.coerceIn(start,end))}+
     overlaps.flatMap{listOf(it.getLong("start_sample").coerceIn(start,end),it.getLong("end_sample").coerceIn(start,end))}).distinct().sorted()
    for(i in 0 until boundaries.size-1){
@@ -327,7 +445,7 @@ class StableSpeakerAssignments(
    }
   }
   val stableWindows=JSONArray();var windowsDropped=0
-  for(w in windows.values.filter{it.source==source}){
+  for(w in output){
    if(stableWindows.length()>=2048){windowsDropped++;continue}
    stableWindows.put(JSONObject().put("source",w.source).put("start_sample",w.start).put("end_sample",w.end)
     .put("local_track",w.track).put("stable_speaker_id",person(w)?.key?:JSONObject.NULL)
@@ -358,6 +476,7 @@ class StableSpeakerAssignments(
  @Synchronized fun resolve(rows:JSONArray,source:String,offsetSamples:Long=0L,final:Boolean=false):JSONArray {
   check(!closed)
   val result=JSONArray(rows.toString())
+  val output=outputWindows(source)
   val ranges=mutableListOf<Pair<Long,Long>>()
   val rowSupports=mutableListOf<List<Window>>()
   val persons=mutableMapOf<String,Person>()
@@ -368,7 +487,7 @@ class StableSpeakerAssignments(
    ranges.add(start to end)
    row.remove("stable_speaker_id");row.remove("speaker_identity_provenance");row.remove("wearer_identity")
    row.put("speaker_display","说话人未识别")
-   val matching=windows.values.filter{it.source==source&&intersection(start,end,it.start,it.end)>0}
+   val matching=output.filter{intersection(start,end,it.start,it.end)>0}
    rowSupports.add(matching)
    if(end<=start)continue
    if(hasOverlap(source,start,end)){
@@ -382,7 +501,10 @@ class StableSpeakerAssignments(
    val coverage=coveredUnion(start,end,confirmed.map{it.second})
    if(unique.size==1&&!unresolved&&coverage.toDouble()/(end-start)>=0.5){
     val person=persons.getValue(unique.single())
-    label(row,person,"pure_activity_voice_evidence",confirmed.map{it.second})
+    val supports=confirmed.map{it.second}
+    val method=if(supports.any{!it.voice.optBoolean("learning_allowed",true)})
+     "recognition_only_short_recurrence" else "pure_activity_voice_evidence"
+    label(row,person,method,supports)
    }else row.put("speaker_identity_provenance",JSONObject().put("method",when{
     unique.size>1->"conflicting_voice_evidence";unresolved->"awaiting_independent_voice_windows";else->"insufficient_pure_activity"
    }))
@@ -392,6 +514,7 @@ class StableSpeakerAssignments(
   for(i in 0 until result.length()){
    val row=result.getJSONObject(i);val range=ranges[i]
    if(stable(row)!=null||range.second-range.first>=24000L||range.second<=range.first||hasOverlap(source,range.first,range.second))continue
+   if(rowSupports[i].any{it.proof.optString("kind")=="recognition_only_short_recurrence"})continue
    val previous=confirmed.lastOrNull{it<i};val following=confirmed.firstOrNull{it>i}
    if(previous==null||following==null){
     row.put("speaker_identity_provenance",JSONObject().put("method",if(!final&&following==null)"waiting_for_next_confirmed_speaker" else "unresolved_short_answer"))
@@ -405,6 +528,7 @@ class StableSpeakerAssignments(
       rowSupports[j].any{w->person(w)?.key?.let{it!=identity}==true}})continue
    val tracks=rowTracks(source,range.first,range.second)
    val flanks=rowSupports[previous]+rowSupports[following]
+   if(flanks.any{it.voice.optBoolean("short_edge_verified")})continue
    // Only use a track inside the original analysis window, never as a global identity.
    val comparable=flanks.filter{w->w.proof.getLong("analysis_window_start")<=range.first&&w.proof.getLong("analysis_window_end")>=range.second}
    if(tracks.isEmpty()||comparable.isEmpty()||comparable.none{it.track in tracks}||comparable.any{it.track !in tracks})continue
@@ -415,6 +539,7 @@ class StableSpeakerAssignments(
  @Synchronized override fun close(){
   if(closed)return;closed=true
   unresolvedLearningSource=null;unresolvedLearning=emptyList()
+  shortWindows.clear()
   try{matcher.close()}finally{try{tracker.close()}finally{analyzer.close()}}
  }
 }
