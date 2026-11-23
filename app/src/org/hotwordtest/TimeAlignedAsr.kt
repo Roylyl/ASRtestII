@@ -19,8 +19,55 @@ import kotlin.math.roundToInt
 /** Offline VAD transcription plus speaker-activity association and independently decoded turns. */
 object TimeAlignedAsr {
  private const val RATE=16000
+ private const val CONTINUOUS_MAX_SAMPLES=20*RATE
  private data class Span(val start:Int,val end:Int,val speaker:Int)
  private data class Turn(val start:Int,var end:Int,var speakers:List<Int>,var inVad:Boolean,var inDiarization:Boolean,var mergedSameIdentity:Boolean=false)
+ data class ContinuousRegion(val startSample:Int,val endSample:Int)
+
+ /** Plan a second text view from the same source evidence, without using speaker IDs. */
+ fun continuousRegions(outcome:JSONObject,sampleCount:Int):List<ContinuousRegion> {
+  require(sampleCount>=0)
+  val intervals=mutableListOf<ContinuousRegion>()
+  fun add(start:Int,end:Int){
+   require(start in 0..sampleCount&&end in start..sampleCount){"语音区间超出原始音频"}
+   if(end>start)intervals.add(ContinuousRegion(start,end))
+  }
+  fun addSamples(rows:JSONArray?){
+   if(rows==null)return
+   for(i in 0 until rows.length()){
+    val row=rows.getJSONObject(i)
+    add(row.getInt("start_sample"),row.getInt("end_sample"))
+   }
+  }
+  addSamples(outcome.optJSONArray("asr_segments")?:outcome.optJSONArray("segments"))
+  val raw=outcome.optJSONObject("raw_speech_activity")?.optJSONArray("activities")
+  if(raw!=null)addSamples(raw) else {
+   val diarization=outcome.optJSONObject("diarization")?.optJSONArray("segments")
+   if(diarization!=null)for(i in 0 until diarization.length()){
+    val row=diarization.getJSONObject(i)
+    val start=(row.getDouble("start_seconds")*RATE).roundToInt().coerceIn(0,sampleCount)
+    val end=(row.getDouble("end_seconds")*RATE).roundToInt().coerceIn(start,sampleCount)
+    add(start,end)
+   }
+  }
+
+  val union=mutableListOf<ContinuousRegion>()
+  for(region in intervals.sortedBy{it.startSample}){
+   val previous=union.lastOrNull()
+   if(previous==null||region.startSample>previous.endSample)union.add(region)
+   else if(region.endSample>previous.endSample)union[union.lastIndex]=previous.copy(endSample=region.endSample)
+  }
+  return buildList {
+   for(region in union){
+    var start=region.startSample
+    while(start<region.endSample){
+     val end=start+minOf(CONTINUOUS_MAX_SAMPLES,region.endSample-start)
+     add(ContinuousRegion(start,end))
+     start=end
+    }
+   }
+  }
+ }
 
  interface Progress {
   fun onVad(index:Int,text:String)
@@ -167,15 +214,15 @@ object TimeAlignedAsr {
     .put("local_tracks_are_people",false).put("process_ms",0.0).put("model_init_ms",0.0)
   }
 
-  private fun transcribeTurn(samples:FloatArray,turn:Turn,cancelled:()->Boolean):JSONObject {
+  private fun decodeText(samples:FloatArray,start:Int,end:Int,cancelled:()->Boolean):String {
    if(cancelled())throw InterruptedException("已停止")
    val stream=recognizer.createStream(hotwords)
-   val text=try{
-    var pos=turn.start
-    while(pos<turn.end){
+   return try{
+    var pos=start
+    while(pos<end){
      if(cancelled())throw InterruptedException("已停止")
-     val end=minOf(pos+800,turn.end)
-     stream.acceptWaveform(samples.copyOfRange(pos,end),RATE);pos=end
+     val next=pos+minOf(800,end-pos)
+     stream.acceptWaveform(samples.copyOfRange(pos,next),RATE);pos=next
      while(recognizer.isReady(stream))recognizer.decode(stream)
     }
     // Flush the 1920ms model at EOF without extending source timestamps.
@@ -187,6 +234,29 @@ object TimeAlignedAsr {
     }
     recognizer.getResult(stream).text
    }finally{stream.release()}
+  }
+
+  /** Decode neutral text over the precomputed union and leave the original task result untouched. */
+  fun transcribeContinuous(samples:FloatArray,regions:List<ContinuousRegion>,
+                           cancelled:()->Boolean={false}):JSONArray {
+   if(cancelled())throw InterruptedException("已停止")
+   val rows=JSONArray()
+   var previousEnd=0
+   for(region in regions){
+    val start=region.startSample
+    val end=region.endSample
+    require(start in previousEnd until end&&end<=samples.size&&end-start<=CONTINUOUS_MAX_SAMPLES){"连续正文区间无效"}
+    val text=decodeText(samples,start,end,cancelled)
+    rows.put(JSONObject().put("start_sample",start).put("end_sample",end)
+     .put("start_ms",start*1000L/RATE).put("end_ms",end*1000L/RATE).put("text",text))
+    previousEnd=end
+   }
+   if(cancelled())throw InterruptedException("已停止")
+   return rows
+  }
+
+  private fun transcribeTurn(samples:FloatArray,turn:Turn,cancelled:()->Boolean):JSONObject {
+   val text=decodeText(samples,turn.start,turn.end,cancelled)
    val ids=JSONArray();turn.speakers.forEach{ids.put(it)}
    val coverage=JSONArray();if(turn.inVad)coverage.put("vad");if(turn.inDiarization)coverage.put("diarization")
    return JSONObject().put("start_sample",turn.start).put("end_sample",turn.end)

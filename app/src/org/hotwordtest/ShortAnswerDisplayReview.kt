@@ -62,9 +62,14 @@ internal object ShortAnswerDisplayReview {
 
  @Throws(InterruptedException::class)
  fun apply(assets:AssetManager,decisionConfig:SpeakerDecisionConfig,samples:FloatArray,activity:JSONObject,
-           rows:JSONArray,cancelled:()->Boolean):JSONArray {
+           rows:JSONArray,cancelled:()->Boolean):JSONArray =
+  apply(assets,decisionConfig,samples,activity,rows,enableShiftedSeconds=false,cancelled=cancelled)
+
+ @Throws(InterruptedException::class)
+ fun apply(assets:AssetManager,decisionConfig:SpeakerDecisionConfig,samples:FloatArray,activity:JSONObject,
+           rows:JSONArray,enableShiftedSeconds:Boolean,cancelled:()->Boolean):JSONArray {
   val direct=reviewDirect(assets,decisionConfig,samples,activity,rows,cancelled)
-  return HalfSecondAnswerReview.apply(assets,decisionConfig,samples,activity,direct,cancelled)
+  return HalfSecondAnswerReview.apply(assets,decisionConfig,samples,activity,direct,enableShiftedSeconds,cancelled)
  }
 
  private fun reviewDirect(assets:AssetManager,decisionConfig:SpeakerDecisionConfig,samples:FloatArray,activity:JSONObject,

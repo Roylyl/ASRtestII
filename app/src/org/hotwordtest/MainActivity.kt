@@ -25,6 +25,11 @@ import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 
 class MainActivity:Activity(){
+ private companion object { const val CONTINUOUS_EXPORT_REQUEST=46 }
+ private var continuousFileText:ContinuousFileText?=null
+ private var continuousRunning=false
+ private var continuousDialog:android.app.AlertDialog?=null
+ private var pendingContinuousExport:String?=null
  private val blue=Color.rgb(0,122,255); private val bg=Color.rgb(242,242,247)
  private val groups get() = WordPacks.groups
  private val prefs by lazy { getSharedPreferences("hotword_test",0) }
@@ -58,6 +63,7 @@ class MainActivity:Activity(){
  private fun sourceStatus(value:String)=(if(recognitionSource.isEmpty())value else "来源：$recognitionSource · $value")+
   if(reviewNote.isEmpty())"" else " · $reviewNote"
  private fun beginRecognition(source:String){
+  clearContinuousFileText()
   learningRun?.cancel()
   val learningPrefs=prefs
   learningRun=VoiceLearningRun(applicationContext,
@@ -75,7 +81,7 @@ class MainActivity:Activity(){
   summaryText="勘误完成后在此显示摘要。"
  }
  private fun idleForReview():Boolean = !recognitionBusy && !active.get() && !startRequested &&
-  !diarizationRunning && !polishRunning && !readingDraft && !VoiceLearningCorrectionsUi.isBusy && !learningEvaluation.isBusy && !destroyed
+  !diarizationRunning && !polishRunning && !readingDraft && !continuousRunning && !VoiceLearningCorrectionsUi.isBusy && !learningEvaluation.isBusy && !destroyed
  private fun hasReviewMaterial() = reviewRows.isNotEmpty() || importedDraft
  private fun reusableEdit(target:Pair<String,String>)=completedEdit?.takeIf{importedDraft || editTarget==target}
 
@@ -405,9 +411,113 @@ class MainActivity:Activity(){
   dialog.setOnDismissListener{expandedOutput=null;expandedKind=null}
   dialog.show()
  }
+ private fun clearContinuousFileText(){
+  val previous=continuousFileText
+  continuousFileText=null
+  continuousDialog?.dismiss()
+  if(!continuousRunning)previous?.releaseAudio()
+ }
+
+ private fun openContinuousFileText(){
+  val source=continuousFileText?:return
+  if(!idleForReview()||continuousDialog!=null)return
+  val cancelled=AtomicBoolean(false)
+  val output=text("正在本地生成连续正文…",17,Color.BLACK).apply{
+   setTextIsSelectable(true)
+   setPadding(dp(20),dp(8),dp(20),dp(16))
+   setLineSpacing(dp(5).toFloat(),1f)
+  }
+  val scroll=ScrollView(this).apply{addView(output);isFillViewport=true}
+  val host=LinearLayout(this).apply{
+   orientation=LinearLayout.VERTICAL
+   addView(scroll,LinearLayout.LayoutParams(-1,dp((resources.configuration.screenHeightDp*0.68f).toInt())))
+  }
+  val dialog=hapticDialog().setTitle("连续正文").setView(host)
+   .setNegativeButton("关闭"){d,_->dialogTap(d)}
+   .setNeutralButton("复制全部",null).setPositiveButton("导出TXT",null).create()
+  continuousDialog=dialog
+  dialog.setOnDismissListener{
+   cancelled.set(true)
+   if(continuousDialog===dialog)continuousDialog=null
+  }
+  dialog.show()
+  val copy=dialog.getButton(android.app.AlertDialog.BUTTON_NEUTRAL)
+  val export=dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE)
+  fun showOriginal(value:String){
+   output.text=value.ifEmpty{"未识别到文字"}
+   copy.isEnabled=value.isNotEmpty()
+   export.isEnabled=value.isNotEmpty()
+  }
+  copy.isEnabled=false
+  export.isEnabled=false
+  copy.setOnClickListener{
+   val value=source.text?:return@setOnClickListener
+   dialogTap(dialog)
+   getSystemService(android.content.ClipboardManager::class.java)
+    .setPrimaryClip(android.content.ClipData.newPlainText("连续正文",value))
+   Toast.makeText(this,"已复制",Toast.LENGTH_SHORT).show()
+  }
+  export.setOnClickListener{
+   val value=source.text?:return@setOnClickListener
+   dialogTap(dialog)
+   exportContinuousFileText(value)
+  }
+  val cached=source.text
+  if(cached!=null){showOriginal(cached);return}
+  continuousRunning=true
+  refreshPolishUi()
+  Thread{
+   val result=runCatching{source.load(assets){cancelled.get()||destroyed}}
+   runOnUiThread{
+    continuousRunning=false
+    if(destroyed||continuousFileText!==source){source.releaseAudio();return@runOnUiThread}
+    if(!cancelled.get()){
+     result.fold(::showOriginal){error->
+      output.text="生成失败：${error.message?:error.javaClass.simpleName}。关闭后可重试。"
+     }
+    }
+    refreshPolishUi()
+   }
+  }.start()
+ }
+
+ private fun exportContinuousFileText(value:String){
+  if(pendingContinuousExport!=null)return
+  val pick=Intent(Intent.ACTION_CREATE_DOCUMENT).apply{
+   addCategory(Intent.CATEGORY_OPENABLE)
+   type="text/plain"
+   putExtra(Intent.EXTRA_TITLE,"连续正文.txt")
+  }
+  pendingContinuousExport=value
+  try{startActivityForResult(pick,CONTINUOUS_EXPORT_REQUEST)}
+  catch(e:Exception){
+   pendingContinuousExport=null
+   Toast.makeText(this,"无法打开保存位置",Toast.LENGTH_SHORT).show()
+  }
+ }
+
+ private fun finishContinuousExport(uri:Uri?,resultCode:Int){
+  val value=pendingContinuousExport
+  pendingContinuousExport=null
+  if(resultCode!=Activity.RESULT_OK||uri==null||value==null)return
+  Thread{
+   val result=runCatching{
+    val stream=contentResolver.openOutputStream(uri,"wt")?:error("无法写入所选位置")
+    stream.use{it.write(value.toByteArray(Charsets.UTF_8))}
+   }
+   runOnUiThread{
+    if(!destroyed)Toast.makeText(this,result.fold({"已导出"}){"导出失败：${it.message}"},Toast.LENGTH_SHORT).show()
+   }
+  }.start()
+ }
+
  private fun resultHeading(title:String):LinearLayout=LinearLayout(this).apply{
   orientation=LinearLayout.HORIZONTAL;gravity=Gravity.CENTER_VERTICAL
   addView(text(title,18,Color.BLACK).apply{setTypeface(null,Typeface.BOLD)},LinearLayout.LayoutParams(0,-2,1f))
+  if(title=="识别结果"&&continuousFileText!=null)addView(text("连续正文",14,blue).apply{
+   minWidth=dp(72);minHeight=dp(44);gravity=Gravity.CENTER
+   onHapticClick{openContinuousFileText()}
+  },LinearLayout.LayoutParams(-2,-2))
   addView(text("展开",14,blue).apply{
    minWidth=dp(48);minHeight=dp(44);gravity=Gravity.CENTER;contentDescription="展开$title";onHapticClick{openExpanded(title)}
   },LinearLayout.LayoutParams(-2,-2))
@@ -475,8 +585,8 @@ class MainActivity:Activity(){
   recordAction.text=if(recognizing)if(recognitionSource=="手机麦克风")"结束手机录音" else "停止识别" else "开始手机录音"
   draftAction.text=if(readingDraft)"正在读取勘误稿…" else "打开已有勘误稿"
   draftAction.isEnabled=idleForReview()
-  recordAction.isEnabled=!readingDraft&&!polishRunning&&(!recognitionBusy||recognizing)
-  importAction.isEnabled=!readingDraft&&!polishRunning&&!recognizing&&!recognitionBusy
+  recordAction.isEnabled=!readingDraft&&!polishRunning&&!continuousRunning&&(!recognitionBusy||recognizing)
+  importAction.isEnabled=!readingDraft&&!polishRunning&&!continuousRunning&&!recognizing&&!recognitionBusy
   polishAction.isEnabled=idleForReview()&&(hasReviewMaterial()||!cloudReady(settings))
   listOf(recordAction,importAction,polishAction,draftAction).forEach{it.alpha=if(it.isEnabled)1f else 0.45f}
   refreshExpanded()
@@ -758,7 +868,7 @@ class MainActivity:Activity(){
  override fun onBackPressed(){handleAppBack()}
  private fun stop(){startRequested=false;if(diarizationRunning){setStatus("正在结束，等待当前处理完成…");return};active.set(false);setStatus("正在结束并刷新尾句…")}
  override fun onStop(){ramMonitor?.shutdownNow();ramMonitor=null;super.onStop();voiceEnrollment.cancel();learningEvaluation.cancel();VoiceLearningCorrectionsUi.cancel();if(active.get() || startRequested)stop()}
- override fun onDestroy(){updateUi.close();voiceEnrollment.cancel();learningEvaluation.cancel();VoiceLearningCorrectionsUi.cancel();learningRun?.cancel();destroyed=true;polishWorker?.interrupt();active.set(false);startRequested=false;super.onDestroy()}
+ override fun onDestroy(){updateUi.close();voiceEnrollment.cancel();learningEvaluation.cancel();VoiceLearningCorrectionsUi.cancel();learningRun?.cancel();destroyed=true;clearContinuousFileText();polishWorker?.interrupt();active.set(false);startRequested=false;super.onDestroy()}
  private fun ensureModels():File{val dir=File(filesDir,"model-1920");dir.mkdirs();for(n in listOf("encoder-1920ms.onnx","decoder-1920ms.onnx","joiner-1920ms.onnx","tokens.txt","bpe.vocab")){val file=File(dir,n);if(!file.exists()||file.length()==0L){val tmp=File(dir,"$n.tmp");assets.open("models/1920/$n").use{input->tmp.outputStream().use{input.copyTo(it)}};check(tmp.renameTo(file)){"模型文件准备失败"}}};return dir}
  private fun words():List<Pair<String,Float>>{val out=linkedMapOf<String,Float>();val selected=prefs.getStringSet("selected",emptySet())!!;fun add(w:String,score:Float){if(w.isNotEmpty())out[w]=maxOf(out[w]?:0f,score)};groups.forEach{(k,v)->if(k in selected){val score=listOf(1f,2f,3f,4f)[prefs.getInt("weight_"+k,0).coerceIn(0,3)];v.split(',').forEach{add(it.trim(),score)}}};if(prefs.getBoolean("customEnabled",false)){val score=listOf(1f,2f,3f,4f)[prefs.getInt("weight_custom",0).coerceIn(0,3)];prefs.getString("custom","")!!.lines().map{it.trim()}.forEach{add(it,score)}};return out.map{it.key to it.value}}
  private fun hotwordString(terms:List<Pair<String,Float>>):String {
@@ -835,6 +945,7 @@ class MainActivity:Activity(){
  }
  private fun startDiarization(uri:Uri){
   if(!idleForReview())return
+  clearContinuousFileText()
   val model=selectedSpeakerModel();diarizationRunning=true;startRequested=true;active.set(true);page=0;status="加载说话人切分模型…";transcript="";render()
   Thread{
    try{
@@ -891,6 +1002,7 @@ class MainActivity:Activity(){
   }.start()
  }
  private fun loadDraft(draft:TranscriptReview.Edited){
+  clearContinuousFileText()
   reviewRows=emptyList()
   val shownDraft=draft.copy(rows=displayRows(draft.rows))
   completedEdit=shownDraft
@@ -903,11 +1015,13 @@ class MainActivity:Activity(){
   setResult("本次打开的是已有勘误稿，原始识别结果未载入。")
   polishText=TranscriptReview.render(shownDraft.rows)
   summaryText="点击“重新生成摘要”后，将使用这份勘误稿生成摘要。"
-  if(page!=0){page=0;render()}else refreshPolishUi()
+  page=0
+  render()
   if(!cloudReady(cloudSettings.summary()))offerCloudSettings()
  }
  override fun onActivityResult(requestCode:Int,resultCode:Int,data:Intent?){
   super.onActivityResult(requestCode,resultCode,data)
+  if(requestCode==CONTINUOUS_EXPORT_REQUEST){finishContinuousExport(data?.data,resultCode);return}
   if(learningEvaluation.onActivityResult(requestCode,resultCode,data))return
   if(resultCode!=Activity.RESULT_OK)return
   val uri=data?.data?:return
@@ -995,6 +1109,7 @@ class MainActivity:Activity(){
   val useTurns=useSpeaker && if(probe)intent.getBooleanExtra("probeSpeakerTurns",false) else prefs.getBoolean("live_speaker_turns",true)
   val untimedFiles=org.json.JSONArray()
   Thread {var engine:OnlineRecognizer?=null;var speaker:LocalSpeakerTracker?=null;var basicVoice:StableSpeakerAssignments?=null;var aligned:TimeAlignedAsr.Session?=null;val tmp=File(cacheDir,"import-"+System.nanoTime());tmp.mkdirs();val results=org.json.JSONArray();val output=StringBuilder();var message=""
+   var continuousResult:ContinuousFileText?=null
    try {
     val inputFile=File(tmp,"source");(if(uri.scheme=="file")File(uri.path!!).inputStream() else contentResolver.openInputStream(uri)?:error("无法打开所选文件")).use{ input-> inputFile.outputStream().use { copyLimited(input,it,512L*1024*1024) } }
     // Preserve the actual ZIP entry ordinal even after display-name sorting.
@@ -1019,6 +1134,8 @@ class MainActivity:Activity(){
      engine=OnlineRecognizer(config=OnlineRecognizerConfig(featConfig=FeatureConfig(sampleRate=16000,featureDim=80),modelConfig=OnlineModelConfig(transducer=OnlineTransducerModelConfig(encoder=File(model,"encoder-1920ms.onnx").path,decoder=File(model,"decoder-1920ms.onnx").path,joiner=File(model,"joiner-1920ms.onnx").path),tokens=File(model,"tokens.txt").path,numThreads=2,provider="cpu",modelType="zipformer2",modelingUnit=if(hot.isEmpty())"" else "bpe",bpeVocab=if(hot.isEmpty())"" else File(model,"bpe.vocab").path),enableEndpoint=false,decodingMethod=if(hot.isEmpty())"greedy_search" else "modified_beam_search",maxActivePaths=4,hotwordsScore=4.0f))
      if(useSpeaker)basicVoice=StableSpeakerAssignments(assets,this@MainActivity,speakerKey,decisionConfig)
     }
+    val continuousInputs=mutableListOf<ContinuousFileText.Input>()
+    val originalWholeText=mutableListOf<String>()
     var nextStart=0L
     var silentFiles=0
     var firstFailure=""
@@ -1030,6 +1147,7 @@ class MainActivity:Activity(){
      val fileSegments=org.json.JSONArray()
      val completedLines=mutableListOf<String>()
      var sampleCount:Int?=null
+     var continuousActivity:org.json.JSONObject?=null
      var stream:OnlineStream?=null
      var cancelled:InterruptedException?=null
      val progress=if(useTurns&&!probe)FileProgress(progressLabel,offset,output.toString()) else null
@@ -1083,6 +1201,7 @@ class MainActivity:Activity(){
         learningRun?.collectPrioritized(fileSegments,pure,unresolved,sourceIdentity,label,offset)
         learningRun?.collectFileSpanning(fileSegments,pure,unresolved,sourceIdentity,label,offset)
         if(fileSegments.length()>0)basicVoice?.activityEvidence(sourceIdentity)?.let{activity->
+         continuousActivity=activity
          data.put("segments",ShortAnswerDisplayReview.apply(assets,decisionConfig,samples,activity,fileSegments){!startRequested})
         }
        }
@@ -1120,6 +1239,16 @@ class MainActivity:Activity(){
      }else{
       record.put("input_samples",count).put("duration_ms",count*1000L/16000).put("merged_offset_samples",offset).put("merged_offset_ms",offset*1000/16000)
      }
+     if(!probe&&count!=null&&record.optString("status")=="completed"){
+      if(useVad){
+       try{
+        val activity=continuousActivity
+        val evidence=if(activity==null)record else org.json.JSONObject()
+         .put("segments",record.getJSONArray("segments")).put("raw_speech_activity",activity)
+        continuousInputs.add(ContinuousFileText.Input(file,count,TimeAlignedAsr.continuousRegions(evidence,count)))
+       }catch(e:Exception){android.util.Log.e("HotwordTest","准备连续正文区间失败",e)}
+      }else originalWholeText.add(record.getString("text"))
+     }
      val fileText=batchTranscript(record,0L)
      record.put("transcript_text",fileText)
      results.put(record)
@@ -1139,11 +1268,20 @@ class MainActivity:Activity(){
     }
     if(startRequested && successful==files.size){
      reviewRows=(0 until results.length()).flatMap{i->val record=results.getJSONObject(i);TranscriptReview.fromResult(record,record.optString("file"))}
-    } 
+    }
+    if(!probe&&startRequested&&successful>0){
+     if(useVad&&continuousInputs.size==successful){
+      continuousResult=ContinuousFileText(tmp,model,hot,continuousInputs.toList())
+      val retained=continuousInputs.map{it.wave}.toSet()
+      tmp.listFiles()?.filter{it !in retained}?.forEach{it.delete()}
+     }else if(!useVad){
+      continuousResult=ContinuousFileText(null,model,hot,emptyList(),ContinuousFileText.originalText(originalWholeText))
+     }
+    }
    }catch(e:Throwable){message=if(e is InterruptedException)"已停止" else "导入失败：${e.message}";android.util.Log.e("HotwordTest","batch failed",e)}
    finally {
     try{aligned?.close()}catch(_:Exception){};try{basicVoice?.close();speaker?.close()}catch(_:Exception){};try{engine?.release()}catch(_:Exception){}
-    tmp.listFiles()?.forEach{it.delete()};tmp.delete()
+    if(continuousResult==null||!useVad){tmp.listFiles()?.forEach{it.delete()};tmp.delete()}
     if(!probe){setStatus("转写完成，正在本地筛选声纹候选…");learningRun?.finish();message+=" · "+(learningRun?.summary()?:"")}
     startRequested=false;active.set(false);setResult(output.toString());setStatus(message)
     val used=org.json.JSONArray()
@@ -1164,7 +1302,12 @@ class MainActivity:Activity(){
       File(dir,"$runName.json").writeText(payload.toString());File(dir,"$runName.txt").writeText(shownOutput)
      }
     }catch(e:Exception){android.util.Log.e("HotwordTest","保存结果失败",e);setStatus("$message；结果保存失败：${e.message}")}
-    runOnUiThread{recognitionBusy=false;if(!destroyed)render()}
+    val finishedContinuous=continuousResult
+    runOnUiThread{
+     recognitionBusy=false
+     if(destroyed)finishedContinuous?.releaseAudio()
+     else{continuousFileText=finishedContinuous;render()}
+    }
    }
   }.start()
  }

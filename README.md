@@ -6,7 +6,7 @@
 <p align="center">在Android手机上离线转写中英文录音，管理和持续补充声纹，按时间与说话人阅读对话。</p>
 
 <p align="center">
-  <a href="./app/AndroidManifest.xml"><img src="https://img.shields.io/badge/version-2.0.2-2563eb?style=flat-square" alt="源码版本2.0.2"></a>
+  <a href="./app/AndroidManifest.xml"><img src="https://img.shields.io/badge/version-2.0.3-2563eb?style=flat-square" alt="源码版本2.0.3"></a>
   <a href="#安装与快速开始"><img src="https://img.shields.io/badge/Android-8.0%2B-27754d?style=flat-square&amp;logo=android&amp;logoColor=white" alt="Android 8.0及以上"></a>
   <a href="#安装与快速开始"><img src="https://img.shields.io/badge/ABI-arm64--v8a-526479?style=flat-square" alt="arm64-v8a架构"></a>
   <a href="#许可证与第三方声明"><img src="https://img.shields.io/badge/Code%20license-Apache--2.0-485d75?style=flat-square" alt="项目原创代码采用Apache-2.0"></a>
@@ -244,7 +244,7 @@ git lfs pull
 pwsh -File .\Build-Apk.ps1 -JdkHome "C:\path\to\jdk-21" -Unsigned
 ```
 
-当前源码的`versionName`为`2.0.2`，`versionCode`为`2000003`。将示例中的JDK路径改成实际安装目录；未签名安装包默认输出到Windows桌面，文件名为`ASRtestII-2.0.2-unsigned.apk`，签名后才能安装。使用自己的Android签名密钥直接构建可安装APK时，指定密钥库和别名，按提示输入密码。
+当前源码的`versionName`为`2.0.3`，`versionCode`为`2000004`。将示例中的JDK路径改成实际安装目录；未签名安装包默认输出到Windows桌面，文件名为`ASRtestII-2.0.3-unsigned.apk`，签名后才能安装。使用自己的Android签名密钥直接构建可安装APK时，指定密钥库和别名，按提示输入密码。
 
 ```powershell
 pwsh -File .\Build-Apk.ps1 -JdkHome "C:\path\to\jdk-21" -Keystore "D:\keys\release.p12" -KeyAlias "release"
@@ -270,7 +270,7 @@ pwsh -File .\Build-Apk.ps1 -JdkHome "C:\path\to\jdk-21" -Keystore "D:\keys\relea
 <summary>维护者发布新版本</summary>
 
 1. 更新[AndroidManifest.xml](./app/AndroidManifest.xml)中的`versionName`，同时递增`versionCode`。
-2. 用原发行证书构建签名APK，使附件名与版本一致。例如`versionName=2.0.2`时，附件名为`ASRtestII-2.0.2.apk`。
+2. 用原发行证书构建签名APK，使附件名与版本一致。例如`versionName=2.0.3`时，附件名为`ASRtestII-2.0.3.apk`。
 3. 在GitHub创建对应版本标签的正式Release，上传APK并填写更新说明。应用按三段版本号比较更新，跳过草稿和预发布版。
 
 </details>

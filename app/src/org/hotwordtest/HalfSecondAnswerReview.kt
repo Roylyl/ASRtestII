@@ -3,6 +3,8 @@ package org.hotwordtest
 import android.content.res.AssetManager
 import org.json.JSONArray
 import org.json.JSONObject
+import kotlin.math.ceil
+import kotlin.math.floor
 
 /** Uses shifted activity to connect a short display turn to independently verified long voices. */
 internal object HalfSecondAnswerReview {
@@ -32,6 +34,15 @@ internal object HalfSecondAnswerReview {
   val a=row.optLong("start_sample",row.optLong("start_ms",-1)*16)
   val b=row.optLong("end_sample",row.optLong("end_ms",-1)*16)
   return if(a>=0&&b>a&&b<=count)Span(offset+a.toInt(),offset+b.toInt()) else null
+ }
+
+ private fun shiftedSecondsCoords(row:JSONObject,count:Int,offset:Int):Span? {
+  val start=row.optDouble("start_seconds")
+  val end=row.optDouble("end_seconds")
+  if(!start.isFinite()||!end.isFinite())return null
+  val a=ceil(start*RATE).coerceIn(0.0,count.toDouble()).toInt()
+  val b=floor(end*RATE).coerceIn(0.0,count.toDouble()).toInt()
+  return if(b>a)Span(offset+a,offset+b) else null
  }
 
  private fun queries(rows:JSONArray,activities:List<Activity>,overlaps:List<Span>,count:Int):List<Query> {
@@ -137,7 +148,12 @@ internal object HalfSecondAnswerReview {
 
  @Throws(InterruptedException::class)
  fun apply(assets:AssetManager,config:SpeakerDecisionConfig,pcm:FloatArray,activity:JSONObject,
-           rows:JSONArray,cancelled:()->Boolean):JSONArray {
+           rows:JSONArray,cancelled:()->Boolean):JSONArray =
+  apply(assets,config,pcm,activity,rows,enableShiftedSeconds=false,cancelled=cancelled)
+
+ @Throws(InterruptedException::class)
+ fun apply(assets:AssetManager,config:SpeakerDecisionConfig,pcm:FloatArray,activity:JSONObject,
+           rows:JSONArray,enableShiftedSeconds:Boolean,cancelled:()->Boolean):JSONArray {
   fun active(){if(cancelled()||Thread.currentThread().isInterrupted)throw InterruptedException("已停止")}
   active()
   val raw=objects(activity.optJSONArray("activities")).mapNotNull{row->
@@ -156,7 +172,8 @@ internal object HalfSecondAnswerReview {
      active()
      val output=session.process(pcm.copyOfRange(start,start+WINDOW)).getJSONObject("unsmoothed")
      objects(output.optJSONArray("segments")).mapNotNull{segment->
-      coords(segment,WINDOW,start)?.let{Activity(it,segment.optString("speaker_id"))}
+      val span=if(enableShiftedSeconds)shiftedSecondsCoords(segment,WINDOW,start) else coords(segment,WINDOW,start)
+      span?.let{Activity(it,segment.optString("speaker_id"))}
      }
     }
    }
