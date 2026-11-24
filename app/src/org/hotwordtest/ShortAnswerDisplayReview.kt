@@ -4,6 +4,8 @@ import android.content.res.AssetManager
 import org.json.JSONArray
 import org.json.JSONObject
 import kotlin.math.abs
+import kotlin.math.ceil
+import kotlin.math.floor
 import kotlin.math.sqrt
 
 /** Final file display only. References come from the unmodified task's long-window supports. */
@@ -13,6 +15,7 @@ internal object ShortAnswerDisplayReview {
  private const val MAX_SHORT=40000
  private const val MAX_ROWS=12
  private const val MAX_GROUPS=4
+ private const val REVIEW_CONTEXT=30*RATE
  private const val MAX_EXTRACTIONS_PER_MODEL=96
  private const val MAX_CLIPPING_FRACTION=0.01
  private const val CLIPPED_SAMPLE_LEVEL=0.995f
@@ -62,20 +65,16 @@ internal object ShortAnswerDisplayReview {
   return groups
  }
 
+ @JvmOverloads
  @Throws(InterruptedException::class)
  fun apply(assets:AssetManager,decisionConfig:SpeakerDecisionConfig,samples:FloatArray,activity:JSONObject,
-           rows:JSONArray,cancelled:()->Boolean):JSONArray =
-  apply(assets,decisionConfig,samples,activity,rows,enableShiftedSeconds=false,cancelled=cancelled)
-
- @Throws(InterruptedException::class)
- fun apply(assets:AssetManager,decisionConfig:SpeakerDecisionConfig,samples:FloatArray,activity:JSONObject,
-           rows:JSONArray,enableShiftedSeconds:Boolean,cancelled:()->Boolean):JSONArray {
-  val direct=reviewDirect(assets,decisionConfig,samples,activity,rows,cancelled)
+           rows:JSONArray,enableShiftedSeconds:Boolean=false,reviewLongActivity:Boolean=false,cancelled:()->Boolean):JSONArray {
+  val direct=reviewDirect(assets,decisionConfig,samples,activity,rows,reviewLongActivity,cancelled)
   return HalfSecondAnswerReview.apply(assets,decisionConfig,samples,activity,direct,enableShiftedSeconds,cancelled)
  }
 
  private fun reviewDirect(assets:AssetManager,decisionConfig:SpeakerDecisionConfig,samples:FloatArray,activity:JSONObject,
-                          rows:JSONArray,cancelled:()->Boolean):JSONArray {
+                          rows:JSONArray,reviewLongActivity:Boolean,cancelled:()->Boolean):JSONArray {
   fun active(){if(cancelled()||Thread.currentThread().isInterrupted)throw InterruptedException("已停止")}
   active()
   val diagnostics=activity.optJSONObject("refinement_diagnostics")?:return rows
@@ -86,6 +85,7 @@ internal object ShortAnswerDisplayReview {
   val groups=references(diagnostics,activities,guards,samples.size)
   if(groups.size !in 2..MAX_GROUPS)return rows
   val queries=mutableListOf<Query>()
+  val extraQueries=mutableListOf<Query>()
   for(i in 0 until rows.length()){
    if(queries.size==MAX_ROWS)break
    val row=rows.getJSONObject(i)
@@ -94,14 +94,18 @@ internal object ShortAnswerDisplayReview {
    val query=range(row,samples.size)?:continue
    if(query.size !in MIN_SHORT until MAX_SHORT||guards.any{it.overlaps(query)})continue
    val family=activities.filter{it.range.overlaps(query)}.singleOrNull()?:continue
-   if(family.range.size>=MAX_SHORT||!family.range.contains(query))continue
+   if(!family.range.contains(query))continue
+   val pool=if(family.range.size<MAX_SHORT)queries else extraQueries
+   if(pool===extraQueries&&(!reviewLongActivity||extraQueries.size>=MAX_ROWS))continue
    if(!hasUsableQueryAudio(samples,query))continue
    val choices=groups.mapValues{(_,items)->items.asSequence()
     .filter{!it.family.range.overlaps(family.range)&&!it.range.overlaps(query)}
     .sortedBy{abs((it.range.start.toLong()+it.range.end)-(query.start.toLong()+query.end))}
     .take(3).toList()}
-   if(choices.values.all{it.size>=2})queries.add(Query(i,query,choices))
+   if(choices.values.all{it.size>=2})pool.add(Query(i,query,choices))
   }
+  val extra=extraQueries.take(MAX_ROWS-queries.size)
+  queries.addAll(extra)
   if(queries.isEmpty())return rows
   val matches=try {
    val cam=verify(assets,SpeakerModels.CAM,decisionConfig,samples,queries,::active)
@@ -112,8 +116,14 @@ internal object ShortAnswerDisplayReview {
   catch(e:Exception){active();return rows}
   active()
   if(matches.isEmpty())return rows
+  // Only additional matches need the contextual check. Ordinary short turns keep priority and their original decision.
+  val matchedIndices=matches.mapTo(mutableSetOf()){it.first}
+  val extraMatches=extra.filter{it.index in matchedIndices}
+  val checked=consistentActivity(assets,decisionConfig,samples,extraMatches,::active)
+  val extraIndices=extraMatches.mapTo(mutableSetOf()){it.index}
   val output=JSONArray(rows.toString())
   for((index,cam,eres) in matches){
+   if(index in extraIndices&&index !in checked)continue
    val row=output.getJSONObject(index)
    row.put("stable_speaker_id",cam.id).put("speaker_display",SpeakerTranscript.groupName(cam.id.substringAfter(':')))
    fun proof(match:Match)=JSONObject().put("independent_similarity",match.independent)
@@ -121,8 +131,49 @@ internal object ShortAnswerDisplayReview {
    row.put("speaker_identity_provenance",JSONObject().put("method","independent_short_file_references")
     .put("recognition_only",true).put("learning_allowed",false)
     .put(SpeakerModels.CAM,proof(cam)).put(SpeakerModels.ERES,proof(eres)))
+   if(index in checked)row.getJSONObject("speaker_identity_provenance").put("activity_check","single_track_across_row_30s_context")
   }
   return output
+ }
+
+ private fun consistentActivity(assets:AssetManager,config:SpeakerDecisionConfig,samples:FloatArray,
+                                queries:List<Query>,active:()->Unit):Set<Int> {
+  if(queries.isEmpty())return emptySet()
+  val size=minOf(samples.size,REVIEW_CONTEXT)
+  val byOrigin=queries.groupBy{(it.range.start+it.range.size/2-size/2).coerceIn(0,samples.size-size)}
+  val verified=mutableSetOf<Int>()
+  try {
+   active()
+   DiarizationTest.Session(assets,SpeakerModels.CAM,-1,similarityThreshold=config.clusterThreshold,rawActivity=true).use{session->
+    for((origin,group) in byOrigin){
+     active()
+     val segments=session.process(samples.copyOfRange(origin,origin+size)).getJSONArray("segments")
+     active()
+     for(query in group){
+      if(singleTrackThroughout(segments,query.range.start-origin,query.range.end-origin))verified.add(query.index)
+     }
+    }
+   }
+  }catch(e:InterruptedException){throw e}
+  catch(e:Exception){active()}
+  return verified
+ }
+
+ /** Native segments are ordered by start time. Scan past full coverage to detect a second overlapping track. */
+ private fun singleTrackThroughout(segments:JSONArray,start:Int,end:Int):Boolean {
+  var track:Int?=null
+  var covered=start
+  for(i in 0 until segments.length()){
+   val span=segments.getJSONObject(i)
+   val left=maxOf(start,ceil(span.getDouble("start_seconds")*RATE).toInt())
+   val right=minOf(end,floor(span.getDouble("end_seconds")*RATE).toInt())
+   if(right<=left)continue
+   val id=span.getInt("speaker_id")
+   if(left>covered||(track!=null&&id!=track))return false
+   track=id
+   covered=maxOf(covered,right)
+  }
+  return covered==end
  }
 
  private fun hasUsableQueryAudio(samples:FloatArray,query:Range):Boolean {

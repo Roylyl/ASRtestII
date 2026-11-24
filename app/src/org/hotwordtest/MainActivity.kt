@@ -831,6 +831,8 @@ class MainActivity:Activity(){
   note(speaker,"需开启VAD。匿名编号显示为“说话人1”“说话人2”等。编号按本次识别结果的首次出现顺序排列。登记姓名也可能误判。")
   toggle(speaker,"细分连续说话人（实验）","live_speaker_turns")
   note(speaker,"需同时开启VAD和声纹区分。连续发言会按人细分，处理耗时可能增加。")
+  toggle(speaker,"复核文件里的待定短句","file_review_long_activity",defaultValue=false)
+  note(speaker,"导入文件时生效，需开启细分连续说话人。会结合前后发言核对短句归属，处理时间会增加。")
   action(speaker,"声纹模型：${SpeakerModels.name(selectedSpeakerModel())}"){chooseSpeakerModel()}
   action(speaker,"声纹阈值与登记"){page=3;render()}
   modelInfo(speaker,"CAM++（26.97MiB）和ERes2NetV2（68.13MiB）提取声纹特征。说话人切分使用pyannote（5.72MiB）检测活动区间。\n\n短于或等于10秒的离线切分仅输出窗口内编号。预测重叠时难以区分每句话的归属。声纹阈值需要结合录音场景校准。")
@@ -1107,6 +1109,7 @@ class MainActivity:Activity(){
  private fun startBatch(uri:Uri,name:String,probe:Boolean){
   if(!idleForReview())return;beginRecognition("文件导入");val useVad=if(probe&&intent.hasExtra("probeVad"))intent.getBooleanExtra("probeVad",false) else prefs.getBoolean("file_vad",true);val useSpeaker=useVad && if(probe&&intent.hasExtra("probeSpeaker"))intent.getBooleanExtra("probeSpeaker",false) else prefs.getBoolean("speaker_enabled",true);val speakerKey=if(probe&&intent.hasExtra("probeSpeakerModel"))SpeakerModels.normalize(intent.getStringExtra("probeSpeakerModel")) else selectedSpeakerModel();val vadKey=if(probe&&intent.hasExtra("probeVadModel"))VadModelFactory.normalize(intent.getStringExtra("probeVadModel")) else selectedVadModel();val threshold=if(probe)LocalSpeakerTracker.EXPERIMENTAL_THRESHOLD else speakerThreshold();val decisionConfig=if(probe)SpeakerDecisionConfig() else speakerDecisionConfig();startRequested=true;active.set(true);page=0;status="正在读取文件…";transcript="";render();val terms=if(probe&&intent.getBooleanExtra("probeNoHotwords",false))emptyList() else words()
   val useTurns=useSpeaker && if(probe)intent.getBooleanExtra("probeSpeakerTurns",false) else prefs.getBoolean("live_speaker_turns",true)
+  val reviewLongActivity=useTurns&&!probe&&prefs.getBoolean("file_review_long_activity",false)
   val untimedFiles=org.json.JSONArray()
   Thread {var engine:OnlineRecognizer?=null;var speaker:LocalSpeakerTracker?=null;var basicVoice:StableSpeakerAssignments?=null;var aligned:TimeAlignedAsr.Session?=null;val tmp=File(cacheDir,"import-"+System.nanoTime());tmp.mkdirs();val results=org.json.JSONArray();val output=StringBuilder();var message=""
    var continuousResult:ContinuousFileText?=null
@@ -1167,7 +1170,8 @@ class MainActivity:Activity(){
         learningRun?.collectPrioritized(turns,pure,unresolved,sourceIdentity,label,offset)
         learningRun?.collectFileSpanning(turns,pure,unresolved,sourceIdentity,label,offset)
         data.optJSONObject("raw_speech_activity")?.let{activity->
-         data.put("speaker_turn_transcripts",ShortAnswerDisplayReview.apply(assets,decisionConfig,samples,activity,turns){!startRequested})
+         data.put("speaker_turn_transcripts",ShortAnswerDisplayReview.apply(assets,decisionConfig,samples,activity,turns,
+          reviewLongActivity=reviewLongActivity){!startRequested})
         }
        }
        data
