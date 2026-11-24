@@ -12,6 +12,7 @@ class LocalSpeakerTracker(assets: AssetManager, modelKey: String = SpeakerModels
   const val EXPERIMENTAL_THRESHOLD = SpeakerDefaults.NATIVE_SIMILARITY_PERCENT / 100.0
   const val WEAK_CAM_SIMILARITY_THRESHOLD = 0.40
   const val WEAK_CAM_MARGIN_THRESHOLD = 0.08
+  internal const val MIN_EMBEDDING_RMS = 0.003
  }
  val modelName=SpeakerModels.name(modelKey)
  init{require(groupingThreshold in 0.0..1.0){"声纹归组阈值需在0.00至1.00之间"}}
@@ -23,7 +24,7 @@ class LocalSpeakerTracker(assets: AssetManager, modelKey: String = SpeakerModels
  internal fun reviewShortEmbedding(samples:FloatArray):FloatArray? = embedding(samples,7200)
  private fun embedding(samples:FloatArray,minSamples:Int):FloatArray? {
   if(samples.size<minSamples||samples.any{!it.isFinite()})return null
-  val rms=sqrt(samples.sumOf{it.toDouble()*it}/samples.size);if(rms<0.003)return null
+  val rms=sqrt(samples.sumOf{it.toDouble()*it}/samples.size);if(rms<MIN_EMBEDDING_RMS)return null
   val stream=extractor.createStream()
   try{
    stream.acceptWaveform(samples,16000);stream.inputFinished();if(!extractor.isReady(stream))return null
@@ -64,7 +65,7 @@ class LocalSpeakerTracker(assets: AssetManager, modelKey: String = SpeakerModels
   val samples=candidate.samples()
   val rms=sqrt(samples.sumOf{it.toDouble()*it}/samples.size)
   val clipped=samples.count{kotlin.math.abs(it)>=0.995f}.toDouble()/samples.size
-  if(samples.size<3*16000 || rms<0.003 || clipped>0.01)return JSONObject().put("speaker_id",JSONObject.NULL).put("speaker_status","low_quality_window")
+  if(samples.size<3*16000 || rms<MIN_EMBEDDING_RMS || clipped>0.01)return JSONObject().put("speaker_id",JSONObject.NULL).put("speaker_status","low_quality_window")
   var assigned=JSONObject().put("speaker_id",JSONObject.NULL).put("speaker_status","insufficient_audio")
   var at=0
   val supports=org.json.JSONArray()

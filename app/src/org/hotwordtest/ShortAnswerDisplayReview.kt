@@ -14,6 +14,8 @@ internal object ShortAnswerDisplayReview {
  private const val MAX_ROWS=12
  private const val MAX_GROUPS=4
  private const val MAX_EXTRACTIONS_PER_MODEL=96
+ private const val MAX_CLIPPING_FRACTION=0.01
+ private const val CLIPPED_SAMPLE_LEVEL=0.995f
  private const val SHORT_VERIFICATION_MINIMUM=0.60
  private val lengths=listOf(8000,16000,24000,32000)
 
@@ -93,6 +95,7 @@ internal object ShortAnswerDisplayReview {
    if(query.size !in MIN_SHORT until MAX_SHORT||guards.any{it.overlaps(query)})continue
    val family=activities.filter{it.range.overlaps(query)}.singleOrNull()?:continue
    if(family.range.size>=MAX_SHORT||!family.range.contains(query))continue
+   if(!hasUsableQueryAudio(samples,query))continue
    val choices=groups.mapValues{(_,items)->items.asSequence()
     .filter{!it.family.range.overlaps(family.range)&&!it.range.overlaps(query)}
     .sortedBy{abs((it.range.start.toLong()+it.range.end)-(query.start.toLong()+query.end))}
@@ -122,6 +125,19 @@ internal object ShortAnswerDisplayReview {
   return output
  }
 
+ private fun hasUsableQueryAudio(samples:FloatArray,query:Range):Boolean {
+  var power=0.0
+  var clipped=0
+  for(index in query.start until query.end){
+   val sample=samples[index]
+   if(!sample.isFinite())return false
+   power+=sample.toDouble()*sample
+   if(abs(sample)>=CLIPPED_SAMPLE_LEVEL)clipped++
+  }
+  return sqrt(power/query.size)>=LocalSpeakerTracker.MIN_EMBEDDING_RMS&&
+   clipped.toDouble()/query.size<=MAX_CLIPPING_FRACTION
+ }
+
  private fun similarity(a:FloatArray,b:FloatArray)=a.indices.sumOf{a[it].toDouble()*b[it]}
 
  private fun referenceRanges(original:Range,length:Int):List<Range> {
@@ -143,7 +159,7 @@ internal object ShortAnswerDisplayReview {
    if(cache.containsKey(range))return cache[range]
    if(cache.size>=MAX_EXTRACTIONS_PER_MODEL)return null
    val pcm=samples.copyOfRange(range.start,range.end)
-   val value=if(pcm.count{abs(it)>=0.995f}.toDouble()/pcm.size>0.01)null else extractor.reviewShortEmbedding(pcm)
+   val value=if(pcm.count{abs(it)>=CLIPPED_SAMPLE_LEVEL}.toDouble()/pcm.size>MAX_CLIPPING_FRACTION)null else extractor.reviewShortEmbedding(pcm)
    cache[range]=value
    return value
   }
