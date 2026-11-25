@@ -1132,7 +1132,11 @@ class MainActivity:Activity(){
     require(files.isNotEmpty()){ "文件中没有WAV" };files.sortBy{it.first}
     val model=ensureModels();if(!startRequested)throw InterruptedException("已停止");val hot=if(terms.isNotEmpty())hotwordString(terms) else ""
     setStatus("加载模型，准备识别${files.size}条音频…")
-    if(useTurns)aligned=TimeAlignedAsr.Session(assets,model,speakerKey,hot,vadKey,context=this@MainActivity,speakerThreshold=threshold,decisionConfig=decisionConfig)
+    var reviewReferences:ShortAnswerDisplayReview.ReferenceCache?=null
+    val reviewObserver:((FloatArray,org.json.JSONObject)->Unit)?=if(reviewLongActivity)
+     ({vector,evidence->reviewReferences?.record(vector,evidence)}) else null
+    if(useTurns)aligned=TimeAlignedAsr.Session(assets,model,speakerKey,hot,vadKey,context=this@MainActivity,
+     speakerThreshold=threshold,decisionConfig=decisionConfig,evidenceObserver=reviewObserver)
     else{
      engine=OnlineRecognizer(config=OnlineRecognizerConfig(featConfig=FeatureConfig(sampleRate=16000,featureDim=80),modelConfig=OnlineModelConfig(transducer=OnlineTransducerModelConfig(encoder=File(model,"encoder-1920ms.onnx").path,decoder=File(model,"decoder-1920ms.onnx").path,joiner=File(model,"joiner-1920ms.onnx").path),tokens=File(model,"tokens.txt").path,numThreads=2,provider="cpu",modelType="zipformer2",modelingUnit=if(hot.isEmpty())"" else "bpe",bpeVocab=if(hot.isEmpty())"" else File(model,"bpe.vocab").path),enableEndpoint=false,decodingMethod=if(hot.isEmpty())"greedy_search" else "modified_beam_search",maxActivePaths=4,hotwordsScore=4.0f))
      if(useSpeaker)basicVoice=StableSpeakerAssignments(assets,this@MainActivity,speakerKey,decisionConfig)
@@ -1153,6 +1157,7 @@ class MainActivity:Activity(){
      var continuousActivity:org.json.JSONObject?=null
      var stream:OnlineStream?=null
      var cancelled:InterruptedException?=null
+     reviewReferences=null
      val progress=if(useTurns&&!probe)FileProgress(progressLabel,offset,output.toString()) else null
      val record=try{
       val samples=file.inputStream().use{WavReader.read16k(it)}
@@ -1162,6 +1167,7 @@ class MainActivity:Activity(){
       val location=if(zipOrdinal!=null)FileSourceIdentity.zipEntry(uri.toString(),zipOrdinal,label) else FileSourceIdentity.singleFile(uri.toString())
       val sourceIdentity=if(useSpeaker&&!probe)FileSourceIdentity.recording(location,samples){!startRequested} else location
       if(useTurns){
+       if(reviewLongActivity)reviewReferences=ShortAnswerDisplayReview.ReferenceCache(speakerKey,sourceIdentity)
        val data=aligned!!.process(samples,cancelled={!startRequested},progress=progress,source=sourceIdentity).put("mode","speaker_turns")
         .put("transcript_scope","speaker_turns_only").put("speaker_decision_config",speakerDecisionJson(decisionConfig))
        val pure=aligned!!.takeLearningCandidates();val unresolved=aligned!!.takeUnresolvedLearningCandidates()
@@ -1171,7 +1177,7 @@ class MainActivity:Activity(){
         learningRun?.collectFileSpanning(turns,pure,unresolved,sourceIdentity,label,offset)
         data.optJSONObject("raw_speech_activity")?.let{activity->
          data.put("speaker_turn_transcripts",ShortAnswerDisplayReview.apply(assets,decisionConfig,samples,activity,turns,
-          reviewLongActivity=reviewLongActivity){!startRequested})
+          reviewLongActivity=reviewLongActivity,referenceCache=reviewReferences){!startRequested})
         }
        }
        data
