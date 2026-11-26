@@ -924,8 +924,10 @@ class MainActivity:Activity(){
     learningRun?.collectPrioritized(outcome.getJSONArray("speaker_turn_transcripts"),pureCandidates,unresolvedCandidates,uri.toString(),"")
     learningRun?.collectFileSpanning(outcome.getJSONArray("speaker_turn_transcripts"),pureCandidates,unresolvedCandidates,uri.toString(),"")
     learningRun?.finish()
-    val result=TranscriptPresentation.render(SpeakerTranscript.aligned(outcome))
-    outcome.put("transcript_text",result).put("transcript_scope","speaker_turns_only")
+    val canonical=TranscriptPresentation.render(SpeakerTranscript.aligned(outcome))
+    val result=TranscriptPresentation.render(TranscriptReview.renderFile(outcome,0L)).ifEmpty{canonical}
+    outcome.put("transcript_text",canonical)
+     .put("readable_transcript_text",result).put("transcript_scope","speaker_turns_only")
     val runName="aligned-${System.currentTimeMillis()}"
     File(runs,"$runName.json").writeText(outcome.toString())
     File(runs,"$runName.txt").writeText(result)
@@ -1112,6 +1114,8 @@ class MainActivity:Activity(){
   val reviewLongActivity=useTurns&&!probe&&prefs.getBoolean("file_review_long_activity",false)
   val untimedFiles=org.json.JSONArray()
   Thread {var engine:OnlineRecognizer?=null;var speaker:LocalSpeakerTracker?=null;var basicVoice:StableSpeakerAssignments?=null;var aligned:TimeAlignedAsr.Session?=null;val tmp=File(cacheDir,"import-"+System.nanoTime());tmp.mkdirs();val results=org.json.JSONArray();val output=StringBuilder();var message=""
+   val readableOutput=StringBuilder()
+   fun currentOutput()=if(probe)output.toString() else readableOutput.toString()
    var continuousResult:ContinuousFileText?=null
    try {
     val inputFile=File(tmp,"source");(if(uri.scheme=="file")File(uri.path!!).inputStream() else contentResolver.openInputStream(uri)?:error("无法打开所选文件")).use{ input-> inputFile.outputStream().use { copyLimited(input,it,512L*1024*1024) } }
@@ -1158,7 +1162,7 @@ class MainActivity:Activity(){
      var stream:OnlineStream?=null
      var cancelled:InterruptedException?=null
      reviewReferences=null
-     val progress=if(useTurns&&!probe)FileProgress(progressLabel,offset,output.toString()) else null
+     val progress=if(useTurns&&!probe)FileProgress(progressLabel,offset,currentOutput()) else null
      val record=try{
       val samples=file.inputStream().use{WavReader.read16k(it)}
       sampleCount=samples.size
@@ -1183,7 +1187,7 @@ class MainActivity:Activity(){
        data
       }else if(useVad){
        val recognizer=checkNotNull(engine)
-       val previousFiles=output.toString()
+       val previousFiles=currentOutput()
        fun preview(partial:String=""){
         setResult(listOf(previousFiles,completedLines.joinToString("\n"),partial).filter{it.isNotBlank()}.joinToString("\n"))
        }
@@ -1265,8 +1269,12 @@ class MainActivity:Activity(){
      if(fileText.isNotEmpty()){
       if(output.isNotEmpty())output.append('\n')
       output.append(if(offset==0L)fileText else batchTranscript(record,offset))
+      if(!probe){
+       if(readableOutput.isNotEmpty())readableOutput.append("\n\n")
+       readableOutput.append(TranscriptReview.renderFile(record,offset))
+      }
      }else if(record.optString("status")=="completed")silentFiles++
-     setResult(output.toString())
+     setResult(currentOutput())
      cancelled?.let{throw it}
     }
     val successful=(0 until results.length()).count{results.getJSONObject(it).optString("status")=="completed"}
@@ -1293,18 +1301,20 @@ class MainActivity:Activity(){
     try{aligned?.close()}catch(_:Exception){};try{basicVoice?.close();speaker?.close()}catch(_:Exception){};try{engine?.release()}catch(_:Exception){}
     if(continuousResult==null||!useVad){tmp.listFiles()?.forEach{it.delete()};tmp.delete()}
     if(!probe){setStatus("转写完成，正在本地筛选声纹候选…");learningRun?.finish();message+=" · "+(learningRun?.summary()?:"")}
-    startRequested=false;active.set(false);setResult(output.toString());setStatus(message)
+    startRequested=false;active.set(false);setResult(currentOutput());setStatus(message)
     val used=org.json.JSONArray()
     terms.forEach{(word,score)->used.put(org.json.JSONObject().put("word",word).put("score",score.toDouble()))}
-    val shownOutput=TranscriptPresentation.render(output.toString())
+    val shownOutput=TranscriptPresentation.render(currentOutput())
     val payload=org.json.JSONObject().put("status",message)
      .put("mode",if(useTurns)"speaker_turns" else if(useVad)"vad_segments" else "whole_file")
-     .put("transcript_text",shownOutput).put("voice_learning",if(probe)org.json.JSONObject.NULL else learningRun?.json())
+     .put("transcript_text",if(probe)shownOutput else TranscriptPresentation.render(output.toString()))
+     .put("voice_learning",if(probe)org.json.JSONObject.NULL else learningRun?.json())
      .put("transcript_scope",if(useTurns)"speaker_turns_only" else if(useVad)"vad_segments" else "whole_file")
      .put("merged_time_basis","顺序拼接可读取WAV的16kHz采样时长，单文件记录内为相对时间")
      .put("time_excluded_files",untimedFiles)
      .put("decoding",if(terms.isEmpty())"greedy_search" else "modified_beam_search")
      .put("hotwords",used).put("results",results)
+    if(!probe)payload.put("readable_transcript_text",shownOutput)
     try{
      if(probe)File(getExternalFilesDir(null),"batch-result.json").writeText(payload.toString())
      else{

@@ -89,21 +89,24 @@ object TranscriptReview {
   return transcriptRows(result,source,result.optLong("merged_offset_samples",0L))
  }
 
- // Construct the source lines once. Editing can replace speech only; source, time and label are immutable.
- fun transcriptRows(result:JSONObject,source:String,offset:Long):List<Row>{
-  fun row(startMs:Long,endMs:Long,label:String,text:String,voice:VoiceEvidence?=null):Row?{
-   if(text.isBlank())return null
-   val prefix=SpeakerTranscript.line(startMs,endMs,label,"§").removeSuffix("§")
-   val display=SpeakerTranscript.line(startMs,endMs,label,text)
-   return Row(source,prefix,display.removePrefix(prefix),voice)
-  }
+ private data class FileLine(val startMs:Long,val endMs:Long,val label:String,val text:String,
+                            val voice:VoiceEvidence?=null,val speakerId:String?=null){
+  fun line()=SpeakerTranscript.line(startMs,endMs,label,text)
+
+  fun continues(previous:FileLine?):Boolean =
+   previous!=null&&label==previous.label&&speakerId==previous.speakerId&&
+    (speakerId!=null||label in setOf("说话人未识别","待确认","多人重叠","未区分"))&&
+    startMs-previous.endMs in 0L..2000L
+ }
+
+ private fun fileLines(result:JSONObject,offset:Long):List<FileLine>{
   val turns=result.optJSONArray("speaker_turn_transcripts")
   val segments=turns?:result.optJSONArray("segments")
   if(segments==null){
    if(result.isNull("text"))return emptyList()
    val end=if(!result.isNull("input_samples"))(offset+result.getLong("input_samples"))*1000/16000
     else offset*1000/16000+result.optLong("end_ms")
-   return listOfNotNull(row(offset*1000/16000,end,"未区分",result.getString("text")))
+   return listOf(FileLine(offset*1000/16000,end,"未区分",result.getString("text")))
   }
   return (0 until segments.length()).mapNotNull { i ->
    val seg=segments.getJSONObject(i)
@@ -113,7 +116,34 @@ object TranscriptReview {
    val label=if(turns!=null)SpeakerTranscript.turnLabel(seg) else SpeakerTranscript.segmentLabel(seg).ifBlank{"未区分"}
    val start=time("start");val end=time("end")
    val voice=if(turns!=null)voiceEvidence(seg,start,end) else null
-   row(start,end,label,seg.getString("text"),voice)
+   val provenance=seg.optJSONObject("speaker_identity_provenance")?.optString("method").orEmpty()
+   // Keep contextual short replies and change/overlap labels on their own lines.
+   val speakerId=(seg.opt("stable_speaker_id") as? String)?.takeIf{it.isNotBlank()&&
+    provenance!="matching_confirmed_neighbors_same_raw_track"&&label!="说话人有变化"&&!label.startsWith("重叠：")}
+   FileLine(start,end,label,seg.getString("text"),voice,speakerId)
+  }
+ }
+
+ // Editing can replace speech only; the source, time and label stay in each original row.
+ fun transcriptRows(result:JSONObject,source:String,offset:Long):List<Row> =
+  fileLines(result,offset).mapNotNull{line->
+   if(line.text.isBlank())return@mapNotNull null
+   val prefix=SpeakerTranscript.line(line.startMs,line.endMs,line.label,"§").removeSuffix("§")
+   Row(source,prefix,line.line().removePrefix(prefix),line.voice)
+  }
+
+ /** Render one file at a time so a stable ID or an unresolved state cannot join across WAV boundaries. */
+ internal fun renderFile(result:JSONObject,offset:Long):String=buildString{
+  var previous:FileLine?=null
+  for(line in fileLines(result,offset)){
+   val continues=line.continues(previous)
+   if(line.text.isBlank()){
+    if(!continues)previous=null
+    continue
+   }
+   if(isNotEmpty())append(if(continues)"\n" else "\n\n")
+   append(if(continues)SpeakerTranscript.continuationLine(line.startMs,line.endMs,line.text) else line.line())
+   previous=line
   }
  }
  private fun editSpeaker(row:Row):String=row.prefix.substringAfter(']',"").removeSuffix("：")

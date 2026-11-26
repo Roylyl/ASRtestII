@@ -22,7 +22,10 @@ internal object ShortAnswerDisplayReview {
  private const val MAX_GROUPS=4
  private const val REVIEW_CONTEXT=30*RATE
  private const val MAX_EXTRACTIONS_PER_MODEL=96
- private const val MAX_REUSED_REFERENCES=256
+ private const val SUPPLEMENT_ROWS=64
+ private const val SUPPLEMENT_EXTRACTIONS=128
+ private const val SUPPLEMENT_ACTIVITY_CONTEXTS=12
+ private const val MAX_REUSED_REFERENCES=512
  private const val MAX_CLIPPING_FRACTION=0.01
  private const val CLIPPED_SAMPLE_LEVEL=0.995f
  private const val SHORT_VERIFICATION_MINIMUM=0.60
@@ -98,9 +101,8 @@ internal object ShortAnswerDisplayReview {
   val reviewed=HalfSecondAnswerReview.apply(assets,decisionConfig,samples,activity,direct,enableShiftedSeconds,cancelled)
   if(!reviewLongActivity)return reviewed
   val continued=restoreContinuations(reviewed,activity,samples.size,cancelled)
-  if(confirmedChanges.isEmpty())return continued
   // Other pending lines have already used the unmodified neighbors as anchors.
-  return JSONArray().apply {
+  val resolved=if(confirmedChanges.isEmpty())continued else JSONArray().apply {
    for(row in objects(continued)){
     val change=confirmedChanges[range(row,samples.size)]
     if(change==null||directAnonymousId(row)!=change.optString("original_id")){put(row);continue}
@@ -110,6 +112,91 @@ internal object ShortAnswerDisplayReview {
      .put("association_status","conflicting_speaker_evidence").put("speaker_identity_provenance",change))
    }
   }
+  val supplemented=supplementUndeterminedTurns(assets,decisionConfig,samples,activity,resolved,referenceCache,cancelled)
+  return if(referenceCache==null)supplemented else FileAnonymousCoverageReview.apply(
+   activity.optString("source"),SpeakerModels.CAM,decisionConfig,activity,supplemented,referenceCache,cancelled)
+ }
+
+ /** Independently recheck short, exclusive speech that remains unassigned after the ordinary pass. */
+ private fun supplementUndeterminedTurns(assets:AssetManager,config:SpeakerDecisionConfig,samples:FloatArray,
+                                          activity:JSONObject,rows:JSONArray,referenceCache:ReferenceCache?,
+                                          cancelled:()->Boolean):JSONArray {
+  fun active(){if(cancelled()||Thread.currentThread().isInterrupted)throw InterruptedException("已停止")}
+  val diagnostics=activity.optJSONObject("refinement_diagnostics")?:return rows
+  val tracks=objects(activity.optJSONArray("activities")).mapNotNull{item->
+   range(item,samples.size)?.let{Activity(item.optString("local_track"),it)}
+  }.distinct()
+  val overlaps=objects(activity.optJSONArray("predicted_overlap")).mapNotNull{range(it,samples.size)}
+  val guards=objects(activity.optJSONArray("protected_intervals")).mapNotNull{range(it,samples.size)}+overlaps
+  val groups=references(diagnostics,tracks,guards,samples.size)
+  if(groups.size !in 2..MAX_GROUPS)return rows
+  val hints=objects(diagnostics.optJSONArray("observe_probes")).mapNotNull{probe->
+   if(probe.optString("kind")!="short_recurrence_probe")return@mapNotNull null
+   val grouping=probe.optJSONObject("grouping")?:return@mapNotNull null
+   if(grouping.optString("speaker_status")!="short_old_identity_diagnostic"||
+     !(grouping.optDouble("candidate_margin")>=config.ambiguityMargin)||
+     !(grouping.optDouble("similarity_to_previous")>=maxOf(config.strongMatch,config.clusterThreshold)))return@mapNotNull null
+   val id="anonymous:"+grouping.optString("best_existing_speaker_id")
+   val span=range(probe,samples.size)?:return@mapNotNull null
+   if(id !in groups||guards.any{it.overlaps(span)})return@mapNotNull null
+   Anchor(id,probe.optString("local_track"),span)
+  }
+  val candidates=mutableListOf<Pair<Int,Query>>()
+  for((index,row) in objects(rows).withIndex()){
+   active()
+   if(!row.isNull("stable_speaker_id")||row.optString("speaker_display")!="说话人未识别"||row.optString("text").isBlank())continue
+   if(row.optJSONObject("speaker_identity_provenance")?.optString("method")=="conflicting_voice_evidence"||
+     row.optString("association_status")=="conflicting_speaker_evidence")continue
+   val span=range(row,samples.size)?:continue
+   if(span.size !in MIN_SHORT until MAX_SHORT||guards.any{it.overlaps(span)})continue
+   val family=tracks.filter{it.range.overlaps(span)}.singleOrNull()?:continue
+   if(family.track.isBlank()||!family.range.contains(span)||!hasUsableQueryAudio(samples,span))continue
+   val matchingHints=hints.asSequence().filter{it.track==family.track&&it.span.overlaps(span)&&
+    minOf(it.span.end,span.end)-maxOf(it.span.start,span.start)>=span.size/2}.map{it.id}.distinct().toList()
+   if(matchingHints.size>1)continue
+   val priority=if(matchingHints.isNotEmpty())2 else if(continuationSpeaker(rows,index,span,overlaps,samples.size)!=null)1 else 0
+   val choices=groups.mapValues{(_,items)->items.asSequence()
+    .filter{!it.family.range.overlaps(family.range)&&!it.range.overlaps(span)}
+    .sortedBy{abs((it.range.start.toLong()+it.range.end)-(span.start.toLong()+span.end))}
+    .take(3).toList()}
+   if(choices.values.all{it.size>=2})candidates.add(priority to Query(index,span,choices))
+  }
+  val queries=candidates.sortedByDescending{it.first}.take(SUPPLEMENT_ROWS).associate{it.second to null}
+  if(queries.isEmpty())return rows
+  val cam:Verification
+  val eres:Verification
+  try {
+   cam=verify(assets,SpeakerModels.CAM,config,samples,emptyList(),queries,referenceCache,::active,
+    maxRows=SUPPLEMENT_ROWS,maxExtractions=SUPPLEMENT_EXTRACTIONS)
+   if(cam.compactMatches.isEmpty())return rows
+   eres=verify(assets,SpeakerModels.ERES,config,samples,emptyList(),
+    queries.filterKeys{it.index in cam.compactMatches},referenceCache,::active,
+    maxRows=SUPPLEMENT_ROWS,maxExtractions=SUPPLEMENT_EXTRACTIONS)
+  }catch(e:InterruptedException){throw e}
+  catch(e:Exception){active();return rows}
+  val agreed=queries.keys.filter{query->
+   val first=cam.compactMatches[query.index]
+   first!=null&&first.id==eres.compactMatches[query.index]?.id
+  }
+  val contextByOrigin=agreed.groupBy{sharedActivityOrigin(it,samples.size)}
+  val checked=consistentActivity(assets,config,samples,
+   contextByOrigin.values.take(SUPPLEMENT_ACTIVITY_CONTEXTS).flatten(),::active,sharedContext=true)
+  if(checked.isEmpty())return rows
+  val output=JSONArray(rows.toString())
+  for(index in checked){
+   active()
+   val first=cam.compactMatches.getValue(index)
+   val second=eres.compactMatches.getValue(index)
+   fun proof(match:Match)=JSONObject().put("independent_similarity",match.independent)
+    .put("reference_center_similarity",match.center).put("strongest_competitor",match.competitor)
+   output.getJSONObject(index).put("stable_speaker_id",first.id)
+    .put("speaker_display",SpeakerTranscript.groupName(first.id.substringAfter(':')))
+    .put("speaker_identity_provenance",JSONObject().put("method","supplemental_independent_short_file_references")
+     .put("recognition_only",true).put("learning_allowed",false)
+     .put("activity_check","single_track_across_row_30s_context")
+     .put(SpeakerModels.CAM,proof(first)).put(SpeakerModels.ERES,proof(second)))
+  }
+  return output
  }
 
  private data class Anchor(val id:String,val track:String,val span:Range)
@@ -418,11 +505,20 @@ internal object ShortAnswerDisplayReview {
   return null
  }
 
+ private fun sharedActivityOrigin(query:Query,count:Int):Int {
+  val size=minOf(count,REVIEW_CONTEXT)
+  val center=query.range.start+query.range.size/2
+  return ((center/ACTIVITY_VIEW)*ACTIVITY_VIEW-size/2).coerceIn(0,count-size)
+ }
+
  private fun consistentActivity(assets:AssetManager,config:SpeakerDecisionConfig,samples:FloatArray,
-                                queries:List<Query>,active:()->Unit):Set<Int> {
+                                queries:List<Query>,active:()->Unit,sharedContext:Boolean=false):Set<Int> {
   if(queries.isEmpty())return emptySet()
   val size=minOf(samples.size,REVIEW_CONTEXT)
-  val byOrigin=queries.groupBy{(it.range.start+it.range.size/2-size/2).coerceIn(0,samples.size-size)}
+  val byOrigin=queries.groupBy{
+   if(sharedContext)sharedActivityOrigin(it,samples.size)
+   else (it.range.start+it.range.size/2-size/2).coerceIn(0,samples.size-size)
+  }
   val verified=mutableSetOf<Int>()
   try {
    active()
@@ -482,8 +578,8 @@ internal object ShortAnswerDisplayReview {
  }
 
  private fun verify(assets:AssetManager,model:String,config:SpeakerDecisionConfig,samples:FloatArray,
-                    queries:List<Query>,continuations:Map<Query,String>,referenceCache:ReferenceCache?,
-                    active:()->Unit):Verification {
+                    queries:List<Query>,continuations:Map<Query,String?>,referenceCache:ReferenceCache?,
+                    active:()->Unit,maxRows:Int=MAX_ROWS,maxExtractions:Int=MAX_EXTRACTIONS_PER_MODEL):Verification {
   val extractor=LocalSpeakerTracker(assets,model)
   val cache=mutableMapOf<Range,FloatArray?>()
   var newRanges=0
@@ -495,7 +591,7 @@ internal object ShortAnswerDisplayReview {
    if(cache.containsKey(range))return cache[range]
    val previous=reused(range)
    if(previous==null){
-    if(newRanges>=MAX_EXTRACTIONS_PER_MODEL)return null
+    if(newRanges>=maxExtractions)return null
     newRanges++
    }
    val pcm=samples.copyOfRange(range.start,range.end)
@@ -538,21 +634,21 @@ internal object ShortAnswerDisplayReview {
     val crops:(Reference)->List<Range> = {reference->referenceRanges(reference.range,length)}
     val required=(listOf(query.range)+query.references.values.flatten().flatMap(crops)).toSet()
     // Preserve the existing admission and scoring order for regular reviews.
-    if(required.count{it !in cache}>MAX_EXTRACTIONS_PER_MODEL-cache.size)continue
+    if(required.count{it !in cache}>maxExtractions-cache.size)continue
     attempted.add(query.index)
     match(query,crops)?.let{verified[query.index]=it}
    }
    val compact=linkedMapOf<Int,Match>()
    for((query,id) in continuations){
-    if(attempted.size>=MAX_ROWS)break
+    if(attempted.size>=maxRows)break
     if(query.index in attempted)continue
     val required=(listOf(query.range)+query.references.values.flatten().map{it.range}).toSet()
-    if(required.count{it !in cache&&reused(it)==null}>MAX_EXTRACTIONS_PER_MODEL-newRanges)continue
+    if(required.count{it !in cache&&reused(it)==null}>maxExtractions-newRanges)continue
     attempted.add(query.index)
     val decision=try{match(query){listOf(it.range)}}
     catch(e:InterruptedException){throw e}
     catch(e:Exception){active();null}
-    decision?.takeIf{it.id==id}?.let{compact[query.index]=it}
+    decision?.takeIf{id==null||it.id==id}?.let{compact[query.index]=it}
    }
    return Verification(verified,compact)
   }finally{extractor.close()}

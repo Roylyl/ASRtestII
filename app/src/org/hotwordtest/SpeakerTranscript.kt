@@ -70,6 +70,9 @@ object SpeakerTranscript {
   return "[${timestamp(startMs)}–${timestamp(endMs)}]$speaker：${singleLine(text).trim()}"
  }
 
+ internal fun continuationLine(startMs:Long,endMs:Long,text:String):String =
+  "　[${timestamp(startMs)}–${timestamp(endMs)}]${singleLine(text).trim()}"
+
  fun live(turns:JSONArray):String {
   val rows=mutableListOf<String>()
   for(i in 0 until turns.length()){
